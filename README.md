@@ -12,7 +12,7 @@
 - 🧵 **Clear failures:** the reason in the message, the error lines and full log in a thread.
 - 💻 **Doesn't get in the way.** Builds run in the background in their own copy of the game, so the Mac can be someone's work computer.
 
-Made by Luka Pikula at [Oox](https://ooxlimited.com/). MIT licensed.
+Made by Luka Pikula at [OOX Limited](https://ooxlimited.com/). MIT licensed.
 
 **Contents:** [Get started](#get-started) · [Using the bot](#using-the-bot) · [FAQ](#faq) · [Security](#security-model) · [Setup guide](SETUP.md) · [For developers](DEVELOPERS.md)
 
