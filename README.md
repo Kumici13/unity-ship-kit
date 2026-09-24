@@ -1,28 +1,216 @@
 # unity-ship-kit
 
-A self-hosted Unity Cloud Build for a Mac. QA types `/build` in Discord and gets an installable APK link (and a QR code) a few minutes later, or a TestFlight build on iOS. Builds run in the background in separate clones, so whoever works on that Mac is never disturbed.
+**Your own Unity Cloud Build, on a Mac you already have.** Someone types `/build` in Discord. A few minutes later there's an Android APK to install (tap the link or scan the QR code), or the build is on TestFlight for iPhone. No build server to rent and no minutes to pay for.
 
-- **Builds land in:** a Google Shared Drive (anyone with the link can download, auto-deleted after 30 days)
-- **Runs on:** any Mac with Unity + Xcode, as a launchd agent (`com.shipkit.bot`)
-- **Nightly QA builds**, Play internal-track upload, TestFlight upload, build queue, abort, cleanup
+<p align="center"><img src="docs/demo.jpg" width="420" alt="A finished build in Discord: version, branch, Install and Drive buttons, and a QR code"></p>
+
+- 🛠️ **Build any branch** from Discord: Android APK/AAB or iOS, with dev build and cheat menu toggles.
+- 📱 **Install in one tap.** APKs land on Google Drive with an Install link and a QR code. iOS goes to TestFlight.
+- 🌙 **Nightly QA builds** of every game, skipped when nothing changed.
+- 🔢 **Build numbers that never clash**, checked against Google Play and TestFlight.
+- 📤 **Upload to Google Play** (internal track) with one button, optional.
+- 🧵 **Clear failures:** the reason in the message, the error lines and full log in a thread.
+- 💻 **Doesn't get in the way.** Builds run in the background in their own copy of the game, so the Mac can be someone's work computer.
 
 Made by Luka Pikula at [Oox](https://ooxlimited.com/). MIT licensed.
 
-## Quick start
+**Contents:** [Setup](#setup-step-by-step) · [Using the bot](#for-qa-using-the-bot) · [FAQ](#faq) · [How it works](#for-devs-how-it-works) · [Errors](#error-categories) · [Security](#security-model)
 
-You need a Mac, a Discord server, a Google Play service account and (for iOS) an App Store Connect API key.
+## Setup, step by step
 
-**macOS only.** Needs Python 3.10+. Tested on macOS 26 with Xcode 26 and Unity 6 (6000.0.x); older Unity versions may work but aren't tested.
+Plan on about an hour the first time. Most of it is clicking through the Discord, Google and Apple websites and copying values into **one file, `config.env`**. You don't need to read any code.
 
-```bash
-git clone https://github.com/Kumici13/unity-ship-kit.git && cd unity-ship-kit
-./setup.sh              # installs Python deps + bundletool, creates config.env and projects.json, lists what's missing
-# fill in config.env (see Setup below) and add your games to projects.json
-./setup.sh              # re-run until every check is ✅
-./setup.sh --install    # starts the bot now and on every login
+**Stuck?** Run `./setup.sh`. It checks everything and tells you what's still missing. Then look in [TROUBLESHOOTING.md](TROUBLESHOOTING.md), or [open an issue](https://github.com/Kumici13/unity-ship-kit/issues).
+
+### Faster: let an AI set it up with you
+
+Using [Claude Code](https://claude.com/claude-code) or another AI coding assistant that can run Terminal commands? Open it in an empty folder and paste this:
+
+```text
+Help me set up unity-ship-kit (https://github.com/Kumici13/unity-ship-kit) on this Mac.
+Clone it into ~/unity-ship-kit, read its README.md, then follow "Setup, step by step" with me.
+
+- Ask me first which platforms I build (Android, iOS or both), whether I want Play upload,
+  and whether builds should go to a normal Google Drive or a Workspace Shared Drive.
+  Skip the steps I don't need.
+- Run the Terminal steps yourself. For website steps (Discord, Google, Apple), tell me exactly
+  what to click, one step at a time, and wait until I paste back the value you need.
+- Write the values into config.env and projects.json yourself. Never print, commit or upload
+  secrets (tokens, passwords, keys), and never change files inside my game repos.
+- For projects.json, read each game's ProjectSettings/ProjectSettings.asset to find its package
+  name and bundle ID, and ask me about anything you can't find.
+- Run ./setup.sh after each step and fix what it reports. When it says
+  "All required checks passed.", run ./setup.sh --install and tell me to type /build in Discord.
 ```
 
-Then type `/build game:<your game>` in your build channel. The first build of a game takes 10–30 min (clone + asset import), later ones a few minutes.
+### Before you start: what you need
+
+| | You need |
+|---|---|
+| ✅ Always | A **Mac** (Apple silicon or Intel) that stays on. It can be the Mac someone works on every day: builds run in the background |
+| ✅ Always | **Unity 6** games in **GitHub** repos, and a Unity account (Unity Personal is fine) |
+| ✅ Always | A **Discord server** where you're allowed to add a bot |
+| 🤖 Android | A **Google account** for the build links: a normal Gmail works, or a Google Workspace Shared Drive |
+| 🤖 Android | The game's **keystore** (the `.keystore` file that signs it) and its passwords |
+| 🤖 Android, optional | A **Google Play developer account**, only for the 📤 Upload to Play button |
+| 🍏 iOS, optional | **Xcode** and an **Apple Developer account** (Account Holder or Admin). iOS builds go to TestFlight, so skip this if you only need Android |
+
+Only iOS games? Skip everything Google. Only Android games? Skip everything Apple. No Play upload? Skip the Play parts.
+
+**macOS only.** Tested on macOS 26 with Xcode 26 and Unity 6 (6000.0.x). Doesn't run on Windows or Linux.
+
+### Step 1: Install the tools
+
+Open **Terminal** (press ⌘ Space, type `Terminal`, press Enter) and paste these one at a time.
+
+1. **Homebrew** (installs the other tools). Skip if `brew -v` already works. Follow the "Next steps" it prints at the end.
+   ```bash
+   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+   ```
+2. **Python and Git LFS:**
+   ```bash
+   brew install python git-lfs && git lfs install
+   ```
+3. **Unity Hub**: download it from https://unity.com/download, open it and **sign in**. Under **Settings → Licenses**, make sure you have an active license (Unity Personal is fine). The bot uses this license. You don't need to install Unity editors: the bot installs the version each game needs.
+4. **Unity command line** (the bot uses it to install editors):
+   ```bash
+   curl -fsSL https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh | UNITY_CLI_CHANNEL=beta bash
+   ```
+5. **iOS games only:** install **Xcode** from the Mac App Store and open it once to accept the license.
+6. **Your games on this Mac.** The bot needs a copy of each game repo to know where it lives on GitHub. If your games aren't on this Mac yet:
+   ```bash
+   mkdir -p ~/Documents/GitHub && cd ~/Documents/GitHub
+   git clone https://github.com/<you>/<your-game>.git
+   ```
+   If that asks for a password and fails, set up GitHub sign-in first. The easiest way is `brew install gh && gh auth login`, answering the questions with the defaults.
+
+### Step 2: Download ShipKit
+
+```bash
+cd ~ && git clone https://github.com/Kumici13/unity-ship-kit.git && cd unity-ship-kit
+./setup.sh
+```
+
+The first run creates two files for you to fill in:
+- **`config.env`**: passwords and IDs. Open it with `open -e config.env`. Each line is `NAME=value`: paste the value right after `=`, with no spaces and no quotes. Lines starting with `#` are notes.
+- **`projects.json`**: your games (Step 7).
+
+Many ❌ are normal at this point. The next steps fix them one by one.
+
+### Step 3: Discord bot
+
+1. Go to https://discord.com/developers/applications → **New Application** → name it (e.g. ShipKit).
+2. Left menu **Bot** → **Reset Token** → **Copy**. In `config.env`: `DISCORD_TOKEN=<paste>`. Keep it secret: it's the bot's password.
+3. Left menu **General Information** → copy the **Application ID**. Put it in this link instead of `<APPLICATION_ID>`, open the link and pick your server:
+   `https://discord.com/oauth2/authorize?client_id=<APPLICATION_ID>&scope=bot+applications.commands&permissions=309237763072`
+4. In the Discord app: **User Settings → Advanced → Developer Mode** on. Now right-clicking things shows **Copy … ID**:
+   - Right-click your **server icon** → **Copy Server ID** → `DISCORD_GUILD_ID=`
+   - Make a channel for builds (e.g. `#builds`), right-click it → **Copy Channel ID** → `BUILD_CHANNEL_ID=`
+   - Optional: right-click **yourself** → **Copy User ID** → `OWNER_DISCORD_ID=` (you get a ping when a build starts while that game is open on your Mac).
+   - Optional: right-click a **role** (Server Settings → Roles) → **Copy Role ID** → `ALLOWED_ROLE_ID=` (only people with that role can build) and `UPLOAD_ROLE_ID=` (only they can upload to Play).
+
+### Step 4: Google (Android games only)
+
+**4.1 A Google Cloud project** (free; needs no billing):
+1. Go to https://console.cloud.google.com → top bar project picker → **New project** → any name → **Create**. Make sure it's selected in the top bar.
+2. **☰ → APIs & Services → Library** → search **Google Drive API** → **Enable**. Using Play upload? Also enable **Google Play Android Developer API**.
+
+**4.2 A robot account for Google Play** (a "service account"). **Optional** with a normal Drive (4.3a): skip it if you don't need the 📤 Upload to Play button. Needed for a Shared Drive (4.3b).
+1. **☰ → IAM & Admin → Service Accounts → Create service account** → any name → **Done** (skip the optional roles).
+2. Click it → **Keys → Add key → Create new key → JSON**. A file downloads. Move it somewhere safe:
+   ```bash
+   mkdir -p ~/.config/shipkit && mv ~/Downloads/<the-file>.json ~/.config/shipkit/service-account.json && chmod 600 ~/.config/shipkit/service-account.json
+   ```
+   In `config.env`: `PLAY_SERVICE_ACCOUNT=~/.config/shipkit/service-account.json`
+3. Copy the service account's email (looks like `name@project.iam.gserviceaccount.com`).
+4. Using Play upload: https://play.google.com/console → **Users and permissions → Invite new users** → paste that email → under **App permissions** add your games → tick **Release to testing tracks** → **Invite user**.
+
+**4.3 Where the builds go.** Pick **a** or **b**.
+
+**a) Normal Google Drive** (any Gmail, 15 GB free). Builds go into a "ShipKit builds" folder. The bot can only see files it made itself, nothing else in your Drive.
+1. In Cloud Console: **☰ → Google Auth Platform** → **Get started**. App name: ShipKit. Support email: yours. Audience: **External**. Contact email: yours. Agree → **Create**.
+2. **Audience** → **Publish app** → **Confirm** (status **In production**). Skip this and Google logs the bot out every 7 days.
+3. **Clients → Create client** → Application type **Desktop app** → **Create** → **Download JSON**.
+4. In Terminal, in the `unity-ship-kit` folder:
+   ```bash
+   python3 tools/drive_login.py ~/Downloads/client_secret_<…>.json
+   ```
+   A browser opens. Sign in with the Google account whose Drive should hold the builds. Google warns **"Google hasn't verified this app"**: that's normal, because it's your own app. Click **Advanced → Go to ShipKit (unsafe)** → **Continue**. When the terminal says `Saved`, you're done.
+5. In `config.env`: `DRIVE_MODE=personal`
+
+Builds older than 30 days are deleted automatically so the Drive doesn't fill up. If Google ever logs the bot out (for example after a password change), run step 4 again.
+
+**b) Google Workspace Shared Drive** (if your studio uses Workspace):
+1. https://drive.google.com → **Shared drives → New** → name it e.g. "Builds".
+2. **Manage members** → add the service account email from 4.2 → **Content manager**.
+3. Open the drive. The link looks like `drive.google.com/drive/folders/<ID>`. Copy the `<ID>` part → `DRIVE_SHARED_DRIVE_ID=`
+4. Testers use personal Gmail accounts? A Workspace admin must allow sharing outside the organization for shared drives (admin.google.com → Apps → Google Workspace → Drive and Docs → Sharing settings). Or keep links inside your company: `DRIVE_SHARING=domain` and `DRIVE_DOMAIN=yourstudio.com`.
+
+### Step 5: Android signing key (Android games only)
+
+Use the keystore your game already ships with. The key that signs a game's first Play upload stays its upload key.
+
+In `config.env`:
+```
+KEYSTORE_MAIN_PATH=/Users/<you>/keys/my-game.keystore
+KEYSTORE_MAIN_PASS=<keystore password>
+```
+Add `KEYSTORE_MAIN_ALIASPASS=` only if the key password is different. To see the key name (alias) inside it: `keytool -list -keystore <path>`. Games signed with different keystores get one set each: `KEYSTORE_OTHER_PATH` / `KEYSTORE_OTHER_PASS`, then `"keystore": "other"` in projects.json.
+
+No keystore yet (brand-new game)? Make one and **back it up with its passwords**, because a lost keystore means a painful key reset with Google:
+```bash
+mkdir -p ~/keys && keytool -genkeypair -v -keystore ~/keys/my-game.keystore -alias upload -keyalg RSA -keysize 2048 -validity 10000
+```
+
+### Step 6: Apple (optional, iOS games only)
+
+1. https://appstoreconnect.apple.com → **Users and Access → Integrations → App Store Connect API → Team Keys → +** → any name, access **App Manager** → **Generate**.
+2. **Download API Key** (Apple lets you download it only once) and move it:
+   ```bash
+   mkdir -p ~/.appstoreconnect/private_keys && mv ~/Downloads/AuthKey_*.p8 ~/.appstoreconnect/private_keys/
+   ```
+3. In `config.env`: `ASC_KEY_ID=` the Key ID from the list, `ASC_ISSUER_ID=` the Issuer ID shown above the list, and `ASC_KEY_PATH=~/.appstoreconnect/private_keys/AuthKey_<KEY_ID>.p8`
+4. `TEAM_ID=`: https://developer.apple.com/account → **Membership details → Team ID**.
+5. **Xcode → Settings → Accounts → +** → sign in with an Apple ID that is **Account Holder or Admin** on the team. Then **Manage Certificates → + → Apple Distribution**.
+6. Each game must exist in App Store Connect (**Apps → +**) with the same bundle ID you put in `projects.json`.
+
+### Step 7: Tell it about your games
+
+Open `projects.json` (`open -e projects.json`) and replace the two example games with yours:
+
+```json
+{
+  "my-game": {
+    "repo_path": "~/Documents/GitHub/my-game",
+    "branch": "main",
+    "package_name": "com.mystudio.mygame",
+    "keystore": "main",
+    "key_alias": "upload",
+    "cheat_defines": ["CHEATS"],
+    "platforms": ["android"]
+  }
+}
+```
+
+- `"my-game"`: the name you'll pick in Discord.
+- `repo_path`: where the game is on this Mac (Step 1.6). `branch`: its main branch.
+- `package_name`: Unity → **Project Settings → Player → Android → Identification → Package Name**.
+- `keystore` / `key_alias`: from Step 5.
+- `cheat_defines`: the scripting define your cheat menu hides behind (`#if CHEATS`). Leave `[]` if you have none.
+- `platforms`: `["android"]`, `["ios"]` or `["android", "ios"]`. For iOS also add `"bundle_id": "com.mystudio.mygame"`.
+
+More than one game? Add another block after a comma. Every option: [Adding a game](#adding-a-game).
+
+### Step 8: Check and start
+
+```bash
+./setup.sh              # repeat until it says "All required checks passed."
+./setup.sh --install    # starts the bot now and every time you log in
+```
+
+Your bot now shows as online in Discord. In your build channel type `/build`, pick your game and press Enter. **The first build of a game takes 10–30 minutes** (it downloads Unity and imports every asset). After that, a few minutes.
+
+To keep it running when you're away (reboots, power cuts, sleep), see [Power loss, reboots, sleep](#power-loss-reboots-sleep). Before letting other people use it, read the [Security model](#security-model).
 
 ---
 
@@ -101,6 +289,26 @@ When it finishes:
 
 ---
 
+## FAQ
+
+**Does it work on Windows or Linux?** No. It needs macOS: iOS builds need Xcode, and the bot runs as a macOS background service. Android-only studios still need a Mac for now.
+
+**Will it slow down my Mac while I work?** Builds run at low priority in a separate copy of the game, so your open Unity project and files are never touched. A build still uses a lot of CPU for a few minutes; you'll notice it in heavy tasks, not in normal work.
+
+**How much disk space?** About 100 GB with several games, mostly Unity's import cache. Each game's first build creates it; later builds reuse it. `/status` shows free space.
+
+**Where do builds go, and for how long?** Android: Google Drive, deleted after 30 days. iOS: TestFlight (Apple keeps them 90 days). The last builds are also in `~/ShipKit/artifacts` on the Mac for 30 days.
+
+**Who can download a build?** By default anyone with the link, so testers can use personal Gmail accounts. For unreleased games you can limit links to your company domain: `DRIVE_SHARING=domain`.
+
+**Does it change my game repos?** Never. It builds from its own clone of what's pushed to GitHub. Version numbers, cheat defines and signing are applied only inside the build.
+
+**Does the Mac need to stay on?** Yes, and logged in. [Power loss, reboots, sleep](#power-loss-reboots-sleep) lists the settings that make it come back by itself after a power cut.
+
+**Something failed. Now what?** Read the ❌ reason and the thread under the message, then [Error categories](#error-categories) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md). With [Claude Code](https://claude.com/claude-code), the included `nightly-triage` skill reviews failed builds for you.
+
+---
+
 ## For devs: how it works
 
 ```
@@ -132,6 +340,7 @@ Discord /build ─► bot.py ─ queue (~/ShipKit/builds.json)
 | `requirements.txt` | Python packages |
 | `projects.json` | The games (see below; start from `projects.example.json`) |
 | `tools/nightly_report.py` | One-screen summary of recent builds and why they failed |
+| `tools/drive_login.py` | One-time Google sign-in for `DRIVE_MODE=personal` (builds on a normal Google Drive) |
 | `.claude/skills/nightly-triage` | [Claude Code](https://claude.com/claude-code) skill: review failed builds, fix, verify with a rebuild |
 | `unity-side/ShipKit.cs` | Build entry points, copied into each clone per build. Never commit it into a game repo |
 | `unity-side/BuildScript.cs` | Legacy entry point for `ship.py` |
@@ -176,34 +385,6 @@ Add an entry to `projects.json` (first time: `cp projects.example.json projects.
 
 **Before the first Play upload of a new app,** decide its upload key. Whatever key signs the first upload becomes its upload key (Play Console → App signing → Upload key certificate). With Play App Signing that's recoverable through Play support, but pick on purpose.
 
-### Setup (one-time)
-
-`./setup.sh` does steps 1–2 and 7 and checks the rest. The details:
-
-1. **Unity CLI:** `curl -fsSL https://public-cdn.cloud.unity3d.com/hub/prod/cli/install.sh | UNITY_CLI_CHANNEL=beta bash`
-2. **bundletool:** `mkdir -p tools && curl -sL -o tools/bundletool.jar https://github.com/google/bundletool/releases/download/1.18.1/bundletool-all-1.18.1.jar`
-3. **config.env:** copy `config.env.example` and fill it in:
-   - `PLAY_SERVICE_ACCOUNT`: Play Console service account JSON (Release Manager on every app). The same account uploads to Drive.
-   - `KEYSTORE_<NAME>_PATH/PASS`
-   - `DISCORD_TOKEN`, `DISCORD_GUILD_ID`, `BUILD_CHANNEL_ID`, `OWNER_DISCORD_ID`
-   - `DRIVE_SHARED_DRIVE_ID`: the ID (from its URL) of a Shared Drive used only for builds
-   - Optional: `ALLOWED_ROLE_ID` / `UPLOAD_ROLE_ID`, `DRIVE_SHARING`, `IOS_EXEMPT_ENCRYPTION` (see Security model)
-   - `ASC_KEY_ID`, `ASC_ISSUER_ID`, `ASC_KEY_PATH`, `TEAM_ID` (iOS only)
-4. **Google Drive:** in the service account's GCP project, enable the Drive API. Create a Shared Drive and add the service account email as **Content manager**. Workspace must allow sharing Shared Drive files outside the org.
-5. **Discord:** invite the bot with
-   `https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot+applications.commands&permissions=309237763072`
-   (View Channels, Send Messages, Send in Threads, Create Public Threads, Embed Links, Attach Files, Read History).
-6. **iOS:**
-   - App Store Connect API key (App Manager role) at `~/.appstoreconnect/private_keys/AuthKey_<ID>.p8`. It's used for TestFlight numbers and status.
-   - Xcode → Settings → Accounts signed in with an **Account Holder/Admin** Apple ID. Signing and upload go through that account, because an App Manager key is refused cloud signing.
-   - An **Apple Distribution** certificate for the team in the login keychain (Xcode → Manage Certificates → + Apple Distribution).
-7. **Start the bot:**
-   ```bash
-   sed -e "s|__KIT_DIR__|$PWD|g" -e "s|__HOME__|$HOME|g" -e "s|__PYTHON__|$(command -v python3)|g" \
-       launchd/com.shipkit.bot.plist > ~/Library/LaunchAgents/com.shipkit.bot.plist
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.shipkit.bot.plist
-   ```
-
 ### Operating it
 
 ```bash
@@ -230,8 +411,8 @@ Changes to `pipeline.py`, `ship*.py` and `projects.json` apply from the next bui
 
 ```bash
 python3 pipeline.py build '{"id":"manual1","game":"my-game","platform":"android","format":"apk","branch":"main","dev":false,"cheats":true}'
-python3 pipeline.py prune      # trash Drive builds older than 30 days
-python3 pipeline.py prune '{"dry_run":true}'   # only list what would be trashed
+python3 pipeline.py prune      # remove Drive builds older than 30 days
+python3 pipeline.py prune '{"dry_run":true}'   # only list what would be removed
 ```
 
 The older direct CLIs still work, but they build **in your working repo** (they refuse a dirty tree and check out the branch there):
@@ -256,7 +437,7 @@ Shown on a failed build message (❌ **CATEGORY**) with details in the thread.
 | `UNITY FAILED` | Compile errors or build exception. The thread shows the error lines; full Unity log attached |
 | `VERIFY FAILED` | Built AAB has the wrong package, target SDK < 35, wrong version code, bad signature, or a missing application class |
 | `APK FAILED` | bundletool couldn't make the APK |
-| `DRIVE FAILED` | Drive API off, service account not on the Shared Drive, or external sharing blocked |
+| `DRIVE FAILED` | Drive API off, service account not on the Shared Drive, external sharing blocked, or (personal Drive) the sign-in expired: run `tools/drive_login.py` again |
 | `PLAY FAILED` / `UPLOAD FAILED` | Service account lacks access, or Play already has a higher version code (rebuild) |
 | `XCODE FAILED` / `ASC FAILED` | Signing, provisioning or App Store Connect key problem |
 | `CRASHED` / `SCRIPT ERROR` / `BOT ERROR` | Bug in the pipeline or bot. Check the log |
@@ -269,10 +450,10 @@ See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for known Unity/Xcode/Play/Drive go
 
 - **Dedicated macOS user** for the bot, with nothing else of value in it.
 - **Only trusted people** push to the game repos and sit in the build channel. Set `ALLOWED_ROLE_ID` so only members with that role can use commands and buttons, and `UPLOAD_ROLE_ID` for 📤 Upload to Play.
-- **Least-privilege service account:** Release Manager only on the apps the bot ships, Content manager only on the bot's Shared Drive.
-- **A dedicated Shared Drive** for builds. Cleanup only touches the per-game folders the bot creates, but don't share the drive with anything else anyway.
+- **Least-privilege service account:** Release Manager only on the apps the bot ships, Content manager only on the bot's Shared Drive. With `DRIVE_MODE=personal` the bot's Google sign-in (`drive-token.json`, owner-only) can only see files the bot created.
+- **A dedicated Shared Drive** (or Google account) for builds. Cleanup only touches the per-game folders the bot creates, but don't share it with anything else anyway.
 - `config.env`, keystores, `*.p8`, service-account JSONs, `projects.json` and logs are gitignored — never commit them. `setup.sh` makes `config.env` owner-only (`chmod 600`); the bot warns if it isn't.
 - Keystore passwords reach Unity through environment variables and bundletool through a private temp file, never command-line args (visible in `ps`). Credentials embedded in git URLs are redacted from logs, which are posted to Discord on failure.
 - The Discord token grants full bot control; treat it like a password.
-- **Drive links:** `DRIVE_SHARING=anyone` (default) lets anyone with the link download — convenient for testers' personal accounts, but links can be forwarded. Use `domain` (with `DRIVE_DOMAIN`) or `none` for unreleased games. Builds are trashed after 30 days.
+- **Drive links:** `DRIVE_SHARING=anyone` (default) lets anyone with the link download — convenient for testers' personal accounts, but links can be forwarded. Use `domain` (with `DRIVE_DOMAIN`) or `none` for unreleased games. Builds are removed after 30 days.
 - **iOS export compliance** is your legal declaration: the bot only marks builds as exempt when you set `IOS_EXEMPT_ENCRYPTION=true`.

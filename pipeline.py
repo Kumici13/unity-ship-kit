@@ -103,7 +103,7 @@ def _store_highest(app: dict, platforms: list[str]) -> int:
     """Highest build number Play / TestFlight know. A failed query is not fatal for a
     QA build — the local counter still guarantees uniqueness."""
     best = 0
-    if "android" in platforms:
+    if "android" in platforms and cfg.get("PLAY_SERVICE_ACCOUNT"):  # optional without Play
         try:
             token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"])
             edit = sa.play_edit_insert(app["package_name"], token)
@@ -230,6 +230,10 @@ def common_args(job: dict, app: dict, version: str, n: int) -> list[str]:
 # ── Android ───────────────────────────────────────────────────────────────────
 
 def build_android(job, app, clone, version, n, art: Path) -> dict:
+    if not drive_configured():
+        die(f"[{app['key']}] Android builds need DRIVE_SHARED_DRIVE_ID or DRIVE_MODE=personal",
+            hint="APKs are delivered through Google Drive (README → Setup → Google).",
+            category="BAD CONFIG")
     app.update(sa.resolve_keystore(app, cfg))
     app["new_code"] = n
     app["unity_path"] = ensure_modules(editor_version(clone), ["android"])
@@ -407,7 +411,54 @@ def testflight_wait(app: dict, n: int, what_to_test: str, timeout_s: int = 45 * 
         return "UPLOADED (status unknown)"
 
 
-# ── Google Drive (Shared Drive, via the Play service account) ────────────────
+# ── Google Drive ──────────────────────────────────────────────────────────────
+# DRIVE_MODE=shared   Workspace Shared Drive, via the Play service account (default).
+# DRIVE_MODE=personal a normal Google Drive, via a refresh token from tools/drive_login.py.
+#                     Builds go in a "ShipKit builds" folder; drive.file scope only.
+PERSONAL = cfg.get("DRIVE_MODE", "shared") == "personal"
+
+
+def drive_configured() -> bool:
+    return PERSONAL or bool(cfg.get("DRIVE_SHARED_DRIVE_ID"))
+
+
+def _drive_token() -> str:
+    if not PERSONAL:
+        return sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"], DRIVE_SCOPE)
+    import ssl, certifi
+    path = Path(cfg.get("DRIVE_OAUTH_TOKEN") or "~/.config/shipkit/drive-token.json").expanduser()
+    if not path.exists():
+        die(f"DRIVE_MODE=personal but {path} is missing",
+            hint="Run: python3 tools/drive_login.py <oauth-client.json>", category="BAD CONFIG")
+    t = json.loads(path.read_text())
+    body = urllib.parse.urlencode({**t, "grant_type": "refresh_token"}).encode()
+    try:
+        with urllib.request.urlopen("https://oauth2.googleapis.com/token", body, timeout=30,
+                                    context=ssl.create_default_context(cafile=certifi.where())) as r:
+            return json.loads(r.read())["access_token"]
+    except urllib.error.HTTPError as e:
+        die(f"Google refused the Drive refresh token: {e.read().decode(errors='replace')[:300]}",
+            hint="Run tools/drive_login.py again. If it keeps expiring after 7 days, set the OAuth "
+                 "consent screen's publishing status to In production.", category="DRIVE FAILED")
+
+
+def _drive_root(token: str) -> str:
+    """Parent of the per-game folders: the Shared Drive, or a "ShipKit builds" folder."""
+    if not PERSONAL:
+        return cfg.get("DRIVE_SHARED_DRIVE_ID") or die(
+            "DRIVE_SHARED_DRIVE_ID not set in config.env", category="BAD CONFIG")
+    return _drive_folder(token, cfg.get("DRIVE_FOLDER", "ShipKit builds"), "root")
+
+
+def _drive_folder(token: str, name: str, parent: str) -> str:
+    q = (f"name = '{name}' and '{parent}' in parents and trashed = false "
+         "and mimeType = 'application/vnd.google-apps.folder'")
+    found = _drive("GET", f"{DRIVE_API}/files?" + _drive_q({"q": q, "fields": "files(id)"}),
+                   token, ctype=None)["files"]
+    return found[0]["id"] if found else _drive(
+        "POST", f"{DRIVE_API}/files?supportsAllDrives=true", token,
+        json.dumps({"name": name, "parents": [parent],
+                    "mimeType": "application/vnd.google-apps.folder"}).encode())["id"]
 
 def _drive(method: str, url: str, token: str, body: bytes | None = None,
            ctype: str | None = "application/json", headers: dict | None = None,
@@ -427,13 +478,17 @@ def _drive(method: str, url: str, token: str, body: bytes | None = None,
     except urllib.error.HTTPError as e:
         die(f"Drive API {e.code} on {method} {url.split('?')[0]}: "
             f"{e.read().decode(errors='replace')[:500]}",
-            hint="Check: Drive API enabled in the service account's GCP project; service "
+            hint="Check: Drive API enabled in the OAuth client's GCP project; Drive storage not full."
+                 if PERSONAL else
+                 "Check: Drive API enabled in the service account's GCP project; service "
                  "account is Content Manager on the Shared Drive; DRIVE_SHARED_DRIVE_ID is right; "
                  "Workspace allows sharing Shared Drive files outside the org.",
             category="DRIVE FAILED")
 
 
 def _drive_q(params: dict) -> str:
+    if PERSONAL:
+        return urllib.parse.urlencode(params)
     drive_id = cfg.get("DRIVE_SHARED_DRIVE_ID")
     if not drive_id:
         die("DRIVE_SHARED_DRIVE_ID not set in config.env", category="BAD CONFIG")
@@ -443,16 +498,8 @@ def _drive_q(params: dict) -> str:
 
 
 def drive_upload(path: Path, folder_name: str, name: str) -> str:
-    token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"], DRIVE_SCOPE)
-    drive_id = cfg.get("DRIVE_SHARED_DRIVE_ID")
-    q = (f"name = '{folder_name}' and '{drive_id}' in parents and trashed = false "
-         "and mimeType = 'application/vnd.google-apps.folder'")
-    found = _drive("GET", f"{DRIVE_API}/files?" + _drive_q({"q": q, "fields": "files(id)"}),
-                   token, ctype=None)["files"]
-    folder = found[0]["id"] if found else _drive(
-        "POST", f"{DRIVE_API}/files?supportsAllDrives=true", token,
-        json.dumps({"name": folder_name, "parents": [drive_id],
-                    "mimeType": "application/vnd.google-apps.folder"}).encode())["id"]
+    token = _drive_token()
+    folder = _drive_folder(token, folder_name, _drive_root(token))
 
     size = path.stat().st_size
     session = _drive("POST", f"{DRIVE_UPLOAD_API}/files?uploadType=resumable&supportsAllDrives=true",
@@ -485,8 +532,8 @@ def prune(job: dict) -> dict:
     touched — anything else on the drive is left alone. {"dry_run": true} only lists;
     {"days": N} overrides the age cutoff."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=job.get("days", RETENTION_DAYS))
-    token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"], DRIVE_SCOPE)
-    drive_id = cfg.get("DRIVE_SHARED_DRIVE_ID")
+    token = _drive_token()
+    drive_id = _drive_root(token)
     names = sa.load_projects()
     fq = (f"'{drive_id}' in parents and trashed = false "
           "and mimeType = 'application/vnd.google-apps.folder'")
@@ -509,6 +556,9 @@ def prune(job: dict) -> dict:
         for f in resp.get("files", []):
             deleted.append(f["name"])
             if job.get("dry_run"):
+                continue
+            if PERSONAL:  # trash would still count against the 15 GB
+                _drive("DELETE", f"{DRIVE_API}/files/{f['id']}", token, ctype=None)
                 continue
             # Content managers may only trash; Shared Drive trash empties itself after 30 days.
             _drive("PATCH", f"{DRIVE_API}/files/{f['id']}?supportsAllDrives=true", token,
@@ -591,6 +641,9 @@ def upload(job: dict) -> dict:
         die("AAB for this build is gone (older than 30 days, or the build failed)",
             hint="Run the build again.", category="UPLOAD FAILED")
     app["new_version"] = job["version"]
+    if not cfg.get("PLAY_SERVICE_ACCOUNT"):
+        die("PLAY_SERVICE_ACCOUNT not set in config.env", category="BAD CONFIG",
+            hint="Play upload needs a Google Play service account (README → Setup → Step 4).")
     token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"])
     edit = sa.play_edit_insert(app["package_name"], token)
     highest = sa.play_highest_version_code(app["package_name"], token, edit)

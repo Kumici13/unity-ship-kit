@@ -41,10 +41,16 @@ for f in config.env projects.json; do
 done
 chmod 600 config.env
 val() { grep -E "^$1=" config.env | tail -1 | cut -d= -f2- | tr -d '"'; }
-# Play is only queried for Android builds (default platforms = android + ios).
-needs_play=$(python3 -c 'import json; print(any("android" in v.get("platforms", ["android"]) for v in json.load(open("projects.json")).values()))' 2>/dev/null)
-keys="DISCORD_TOKEN DISCORD_GUILD_ID BUILD_CHANNEL_ID DRIVE_SHARED_DRIVE_ID"
-[ "$needs_play" = False ] || keys="$keys PLAY_SERVICE_ACCOUNT"
+# Google (Play + Drive) is only used for Android builds (default platforms = android + ios).
+needs_google=$(python3 -c 'import json; print(any("android" in v.get("platforms", ["android"]) for v in json.load(open("projects.json")).values()))' 2>/dev/null)
+keys="DISCORD_TOKEN DISCORD_GUILD_ID BUILD_CHANNEL_ID"
+if [ "$needs_google" != False ] && [ "$(val DRIVE_MODE)" = personal ]; then
+    tok=$(val DRIVE_OAUTH_TOKEN); tok=${tok:-~/.config/shipkit/drive-token.json}; tok=${tok/#\~/$HOME}
+    [ -f "$tok" ] && ok "personal Drive token" || bad "no Drive token at $tok — run: python3 tools/drive_login.py <oauth-client.json>"
+    [ -n "$(val PLAY_SERVICE_ACCOUNT)" ] && ok "PLAY_SERVICE_ACCOUNT" || warn "PLAY_SERVICE_ACCOUNT empty — Play upload disabled (optional)"
+elif [ "$needs_google" != False ]; then
+    keys="$keys PLAY_SERVICE_ACCOUNT DRIVE_SHARED_DRIVE_ID"
+fi
 for k in $keys; do
     [ -n "$(val $k)" ] && ok "$k" || bad "$k empty in config.env (see README → Setup)"
 done

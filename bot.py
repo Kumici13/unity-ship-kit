@@ -591,7 +591,7 @@ async def on_interaction(inter: discord.Interaction):
 
 @tasks.loop(hours=24)
 async def prune_drive():
-    if not cfg.get("DRIVE_SHARED_DRIVE_ID"):
+    if not (cfg.get("DRIVE_SHARED_DRIVE_ID") or cfg.get("DRIVE_MODE") == "personal"):
         return
     LOGS.mkdir(parents=True, exist_ok=True)
     with open(LOGS / "prune.log", "w") as log:
