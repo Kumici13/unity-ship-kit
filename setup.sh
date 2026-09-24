@@ -52,13 +52,13 @@ elif [ "$needs_google" != False ]; then
     keys="$keys PLAY_SERVICE_ACCOUNT DRIVE_SHARED_DRIVE_ID"
 fi
 for k in $keys; do
-    [ -n "$(val $k)" ] && ok "$k" || bad "$k empty in config.env (see README → Setup)"
+    [ -n "$(val $k)" ] && ok "$k" || bad "$k empty in config.env (see SETUP.md)"
 done
 sa=$(val PLAY_SERVICE_ACCOUNT); sa=${sa/#\~/$HOME}
 [ -z "$sa" ] || [ -f "$sa" ] || bad "PLAY_SERVICE_ACCOUNT file not found: $sa"
 [ -n "$(val ASC_KEY_ID)" ] && ok "iOS keys (ASC_KEY_ID)" || warn "ASC_* / TEAM_ID empty — iOS builds disabled until set"
 if grep -q '"my-game"' projects.json 2>/dev/null; then
-    warn "projects.json still has the example games — add yours (README → Adding a game)"
+    warn "projects.json still has the example games — add yours (SETUP.md → Step 7)"
 fi
 
 if [ "${1:-}" = --install ]; then

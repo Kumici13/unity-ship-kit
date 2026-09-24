@@ -232,7 +232,7 @@ def common_args(job: dict, app: dict, version: str, n: int) -> list[str]:
 def build_android(job, app, clone, version, n, art: Path) -> dict:
     if not drive_configured():
         die(f"[{app['key']}] Android builds need DRIVE_SHARED_DRIVE_ID or DRIVE_MODE=personal",
-            hint="APKs are delivered through Google Drive (README → Setup → Google).",
+            hint="APKs are delivered through Google Drive (SETUP.md → Step 4).",
             category="BAD CONFIG")
     app.update(sa.resolve_keystore(app, cfg))
     app["new_code"] = n
@@ -643,7 +643,7 @@ def upload(job: dict) -> dict:
     app["new_version"] = job["version"]
     if not cfg.get("PLAY_SERVICE_ACCOUNT"):
         die("PLAY_SERVICE_ACCOUNT not set in config.env", category="BAD CONFIG",
-            hint="Play upload needs a Google Play service account (README → Setup → Step 4).")
+            hint="Play upload needs a Google Play service account (SETUP.md → Step 4).")
     token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"])
     edit = sa.play_edit_insert(app["package_name"], token)
     highest = sa.play_highest_version_code(app["package_name"], token, edit)
