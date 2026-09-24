@@ -1,0 +1,5 @@
+discord.py>=2.4
+segno>=1.6
+certifi
+PyJWT>=2.8
+cryptography>=42

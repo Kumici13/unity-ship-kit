@@ -1,0 +1,20 @@
+{
+  "my-game": {
+    "repo_path": "~/Documents/GitHub/my-game",
+    "branch": "main",
+    "package_name": "com.example.mygame",
+    "keystore": "main",
+    "key_alias": "my key",
+    "cheat_defines": ["CHEATS"],
+    "bundle_id": "com.example.mygame"
+  },
+  "android-only-game": {
+    "repo_path": "~/Documents/GitHub/android-only-game",
+    "branch": "master",
+    "package_name": "com.example.androidonly",
+    "keystore": "main",
+    "key_alias": "my key",
+    "platforms": ["android"],
+    "nightly": false
+  }
+}
