@@ -115,7 +115,7 @@ When it finishes:
 - **QR code**: scan it with your phone camera when you're on a PC. Same thing as Install.
 - **💾 Drive**: normal Google Drive page, for downloading on a PC.
 - **🔁 Rebuild**: same settings, latest commit.
-- **📤 Upload to Play (internal)**: only on `format:aab` release builds (no dev, no cheats), because Play doesn't accept APKs. Sends that exact bundle to the Play Console internal track as a draft.
+- **📤 Upload to Play (internal)**: only on `format:aab` release builds (no dev, no cheats), because Play doesn't accept APKs. Sends that exact bundle to the Play Console internal track as a completed release (live for internal testers, no Console step).
 
 **If nothing changed since the last build**, the bot doesn't build again. It reposts the existing build (♻️) in about 2 seconds. Use `force:True` if you really need a fresh one.
 

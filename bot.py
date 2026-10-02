@@ -18,6 +18,7 @@ Run: python3 bot.py   (launchd/com.shipkit.bot.plist keeps it alive)
 """
 
 import asyncio
+import fcntl
 import json
 import os
 import shutil
@@ -137,9 +138,10 @@ def history(game: str, **match) -> list[dict]:
 
 
 def eta(j: dict) -> str:
-    if j["kind"] != "build":
-        return ""
-    runs = [h["finished"] - h["started"] for h in history(j["game"], platform=j["platform"])[:3]]
+    if j["kind"] != "build" or j.get("progress", "").startswith("Uploading"):
+        return ""  # ponytail: past the Unity step only upload remains; history totals mislead
+    runs = [h["finished"] - h["started"]
+            for h in history(j["game"], platform=j["platform"], dev=j.get("dev"))[:3]]
     if not runs or not j.get("started"):
         return ""
     left = sum(runs) / len(runs) - (time.time() - j["started"])
@@ -157,7 +159,7 @@ def render(j: dict) -> str:
     elif s == "ok":
         r = j.get("result", {})
         if j["kind"] == "upload":
-            lines.append("✅ Draft on Play internal track — promote it in Play Console")
+            lines.append("✅ Released on Play internal track")
         else:
             lines.append(f"✅ {r['version']} ({r['number']}) · `{j['branch']}@{r['sha']}` · "
                          f"{mins(j['started'], j['finished'])}")
@@ -242,6 +244,41 @@ def editor_has_open(repo_path: str) -> bool:
                for l in ps.splitlines())
 
 
+def free_gb() -> int:
+    return shutil.disk_usage(WORK).free // 1024**3
+
+
+def free_disk(keep: set[str]) -> list[str]:
+    """Below LOW_DISK_GB: delete the oldest local artifacts, then the Library cache of the
+    least recently built games, until back above it. Skips games in `keep` and clones
+    another build holds the lock on. Returns what was deleted."""
+    gone = []
+    # ponytail: artifacts before caches — an old .aab only costs "Upload to Play" for that
+    # build (Drive has a copy); a Library costs a full re-import on that game's next build.
+    arts = sorted((WORK / "artifacts").glob("*"), key=lambda d: d.stat().st_mtime)
+    last = {j["game"]: j.get("started") or 0 for j in state["jobs"]}  # jobs are oldest-first
+    games = sorted((d for d in (WORK / "work").glob("*") if d.is_dir() and d.name not in keep),
+                   key=lambda d: last.get(d.name, 0))
+    for d in [*arts, *games]:
+        if free_gb() >= LOW_DISK_GB:
+            break
+        if d.parent.name == "artifacts":
+            shutil.rmtree(d, ignore_errors=True)
+            gone.append(f"artifacts #{d.name}")
+            continue
+        lib = d / "Library"
+        if not lib.exists():
+            continue
+        with open(d.parent / f"{d.name}.lock", "w") as lock:  # same lock pipeline.py takes
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue  # building right now
+            shutil.rmtree(lib, ignore_errors=True)
+        gone.append(f"{d.name} Library cache")
+    return gone
+
+
 async def run_job(j: dict) -> None:
     channel = client.get_channel(CHANNEL_ID)
     j.update(status="running", started=time.time(), progress="Starting")
@@ -249,8 +286,12 @@ async def run_job(j: dict) -> None:
     await refresh(j)
     await refresh_queue()
 
-    if shutil.disk_usage(WORK).free < LOW_DISK_GB * 1024**3:
-        await channel.send(f"⚠️ Low disk: {shutil.disk_usage(WORK).free // 1024**3} GB free on the build Mac.")
+    if free_gb() < LOW_DISK_GB:
+        before = free_gb()
+        gone = await asyncio.to_thread(free_disk, {j["game"], *(q["game"] for q in queued())})
+        await channel.send(f"⚠️ Low disk: {before} GB free on the build Mac. "
+                           + (f"Deleted {', '.join(gone)} → {free_gb()} GB free." if gone
+                              else "Nothing safe to delete."))
     game = projects().get(j["game"], {})
     if OWNER_ID and j["kind"] == "build" and editor_has_open(game.get("repo_path", "")):
         await channel.send(f"<@{OWNER_ID}> FYI: #{j['id']} is building **{j['game']}** while your "

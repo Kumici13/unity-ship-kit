@@ -36,3 +36,26 @@ class SelfBump(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ShippedVersion(unittest.TestCase):
+    """Build 58 of a game went to Play as 0.63 after 0.64: the name came from a reset tree."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = Path(tempfile.mkdtemp()) / "shipped.json"
+        patch = mock.patch.object(sa, "SHIPPED_VERSIONS", self.tmp)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_remembers_a_release_play_no_longer_lists(self):
+        sa.record_shipped("g", "0.64")
+        self.assertEqual(sa.shipped_version("g", "0.63"), "0.64")
+
+    def test_play_wins_when_newer_and_record_never_goes_back(self):
+        sa.record_shipped("g", "0.64")
+        sa.record_shipped("g", "0.63")
+        self.assertEqual(sa.shipped_version("g", "0.70"), "0.70")
+        self.assertEqual(sa.shipped_version("g", None), "0.64")
+        self.assertIsNone(sa.shipped_version("other", None))

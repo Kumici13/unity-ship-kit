@@ -20,3 +20,5 @@ projects.json
 *.apk
 *.apks
 .env
+*.log
+shipped-versions.json

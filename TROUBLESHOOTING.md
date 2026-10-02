@@ -324,6 +324,13 @@ Unity/Gradle set it per build type. The bot now removes the attribute from manif
 `Assets/Plugins/Android` in its clone for release builds (logged as a WARN; the game repo is
 untouched), and `verify_aab` still fails any release build that ends up debuggable.
 
+## 29. Play API 503 "The service is currently unavailable"
+
+A short outage on Google's side, not a permissions problem; it can hit any call (bundles, tracks,
+commit). Play API calls retry 429 and 5xx up to 4 attempts (5/10/20 s backoff). If all four fail,
+nothing was published (the edit is deleted): press **Upload to Play** on the build's message again.
+It re-sends the same AAB without rebuilding. The "lacks Release Manager" hint only shows for 401/403.
+
 ## Debugging tips
 
 **Compare batch vs Editor builds:**

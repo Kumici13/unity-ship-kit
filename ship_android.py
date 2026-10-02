@@ -14,7 +14,7 @@ Steps per app:
     3. Ask Google Play for the highest versionCode it has ever seen  → new = max(local, play) + 1
     4. Copy unity-side/ShipKit.cs into the project, run Unity batchmode, remove it again
     5. aapt2 dump badging the .aab — assert targetSdk and package name before anything is uploaded
-    6. Play Developer API v3: edit → upload bundle → set track (internal, draft) → commit
+    6. Play Developer API v3: edit → upload bundle → set track (internal, completed) → commit
 
 Shares config.env, logging and git helpers with ship.py.
 Logs: ./last-android-build.log
@@ -153,16 +153,43 @@ def _http(method: str, url: str, token: str, body=None, content_type=None,
         headers["Content-Length"] = str(content_length)
     req = urllib.request.Request(url, data=body, headers=headers, method=method)
     ctx = ssl.create_default_context(cafile=certifi.where())
-    try:
-        with urllib.request.urlopen(req, timeout=1800, context=ctx) as r:
-            raw = r.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        detail = e.read().decode(errors="replace")
-        die(f"Play API {e.code} on {method} {url.split('?')[0]}: {detail}",
-            hint="Common causes: the service account lacks Release Manager on this app, "
-                 "or the app has never had a manual release.",
-            category="PLAY FAILED")
+    for attempt in range(PLAY_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=1800, context=ctx) as r:
+                raw = r.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")
+            if _play_transient(e.code, attempt, f"{method} {url.split('?')[0]}"):
+                if hasattr(body, "seek"):
+                    body.seek(0)  # the AAB upload streams an open file
+                continue
+            die(f"Play API {e.code} on {method} {url.split('?')[0]}: {detail}",
+                hint=_play_hint(e.code), category="PLAY FAILED")
+
+
+# Play answers 503 UNAVAILABLE now and then (commit, bundles, tracks — builds.json);
+# a retry a few seconds later goes through.
+PLAY_ATTEMPTS = 4
+
+
+def _play_transient(code: int, attempt: int, what: str) -> bool:
+    """True (after a backoff sleep) if `code` is worth retrying and attempts remain."""
+    if (code == 429 or code >= 500) and attempt < PLAY_ATTEMPTS - 1:
+        wait = 5 * 2 ** attempt
+        log(f"Play API {code} on {what} — retrying in {wait}s", "WARN")
+        time.sleep(wait)
+        return True
+    return False
+
+
+def _play_hint(code: int) -> str | None:
+    if code in (401, 403):
+        return ("Common causes: the service account lacks Release Manager on this app, "
+                "or the app has never had a manual release.")
+    if code == 429 or code >= 500:
+        return "Google Play API is unavailable — nothing was published. Re-run the build."
+    return None
 
 
 def play_token(sa_path: str, scope: str = PLAY_SCOPE) -> str:
@@ -226,7 +253,10 @@ def play_commit(pkg: str, token: str, edit_id: str) -> None:
     base = f"{PLAY_API}/applications/{pkg}/edits/{edit_id}:commit"
 
     last = ""
-    for suffix in ("?changesNotSentForReview=true", ""):
+    attempt = 0
+    suffixes = ["?changesNotSentForReview=true", ""]
+    while suffixes:
+        suffix = suffixes[0]
         req = urllib.request.Request(
             base + suffix, data=b"", method="POST",
             headers={"Authorization": f"Bearer {token}",
@@ -240,26 +270,44 @@ def play_commit(pkg: str, token: str, edit_id: str) -> None:
         except urllib.error.HTTPError as e:
             last = e.read().decode(errors="replace")
             if e.code == 400 and "changesNotSentForReview" in last:
+                suffixes.pop(0)
                 continue  # wrong mode for this app — try the other one
-            die(f"Play commit {e.code} for {pkg}: {last}", category="PLAY FAILED")
+            if _play_transient(e.code, attempt, f"commit {pkg}"):
+                attempt += 1
+                continue  # same mode again
+            hint = ("Someone changed this app on Play (Console or another upload) while this "
+                    "edit was open. Nothing was published — re-run the build."
+                    if "outside of this Edit" in last else _play_hint(e.code))
+            die(f"Play commit {e.code} for {pkg}: {last}", hint=hint, category="PLAY FAILED")
 
     die(f"Play refused both commit modes for {pkg}: {last}", category="PLAY FAILED")
 
 
 def play_edit_delete(pkg: str, token: str, edit_id: str) -> None:
+    # Cleanup is best-effort and silent. Not via _http: its die() rewrites the error
+    # files and @@RESULT, so a failed DELETE replaced the real commit error (2026-10-01).
+    import ssl
+    import certifi
+    req = urllib.request.Request(f"{PLAY_API}/applications/{pkg}/edits/{edit_id}",
+                                 method="DELETE", headers={"Authorization": f"Bearer {token}"})
     try:
-        _http("DELETE", f"{PLAY_API}/applications/{pkg}/edits/{edit_id}", token)
-    except SystemExit:
-        pass  # cleanup is best-effort; the real error is already reported
+        with urllib.request.urlopen(req, timeout=30,
+                                    context=ssl.create_default_context(cafile=certifi.where())) as r:
+            r.read()
+    except Exception:
+        pass
 
 
-def play_highest_version_code(pkg: str, token: str, edit_id: str) -> int:
-    """Highest versionCode Play knows about — uploaded bundles AND anything in a track.
+def play_highest_version_code(pkg: str, token: str, edit_id: str) -> tuple[int, str | None]:
+    """Highest versionCode Play knows about — uploaded bundles AND anything in a track —
+    plus the highest versionName among track releases (release names are "<name> (<code>)").
 
-    Local ProjectSettings.asset routinely lags production, so this is the number that
-    matters. bundles.list covers drafts and superseded uploads that tracks.list omits.
+    Local ProjectSettings.asset routinely lags production (the bot resets the tree after
+    a build, so a bumped bundleVersion is never committed), so these are the numbers
+    that matter. bundles.list covers drafts and superseded uploads that tracks.list omits.
     """
     codes = []
+    name = None
 
     bundles = _http("GET", f"{PLAY_API}/applications/{pkg}/edits/{edit_id}/bundles", token)
     codes += [int(b["versionCode"]) for b in bundles.get("bundles", [])]
@@ -268,15 +316,35 @@ def play_highest_version_code(pkg: str, token: str, edit_id: str) -> int:
     for track in tracks.get("tracks", []):
         for release in track.get("releases", []):
             codes += [int(c) for c in release.get("versionCodes", [])]
+            m = re.match(r"\s*(\d+(?:\.\d+)+)", release.get("name", ""))
+            name = ship.max_version(name, m.group(1)) if m else name
             if release.get("versionCodes"):
                 log(f"  track '{track['track']}': {release.get('status')} "
                     f"{release.get('name', '?')} → {release['versionCodes']}")
 
-    return max(codes) if codes else 0
+    return (max(codes) if codes else 0), name
+
+
+SHIPPED_VERSIONS = Path(__file__).with_name("shipped-versions.json")
+
+
+def shipped_version(key: str, play_name: str | None) -> str | None:
+    """Newest versionName already on Play: its live releases, or the last one this kit
+    uploaded (tracks drop superseded releases, so Play alone forgets e.g. 0.64 once a
+    later release replaces it). ProjectSettings never knows: the tree is reset after a
+    build, so the bump is never committed (build 58 of a game went out as 0.63 after 0.64)."""
+    recorded = json.loads(SHIPPED_VERSIONS.read_text()).get(key) if SHIPPED_VERSIONS.exists() else None
+    return ship.max_version(recorded, play_name)
+
+
+def record_shipped(key: str, version: str) -> None:
+    data = json.loads(SHIPPED_VERSIONS.read_text()) if SHIPPED_VERSIONS.exists() else {}
+    data[key] = ship.max_version(data.get(key), version)
+    SHIPPED_VERSIONS.write_text(json.dumps(data, indent=2))
 
 
 def play_upload(app: dict, aab: Path, cfg: dict, track: str) -> None:
-    section(f"[{app['key']}] Uploading to Play ({track}, draft)")
+    section(f"[{app['key']}] Uploading to Play ({track})")
     pkg = app["package_name"]
     token = play_token(cfg["PLAY_SERVICE_ACCOUNT"])
     edit_id = play_edit_insert(pkg, token)
@@ -300,19 +368,22 @@ def play_upload(app: dict, aab: Path, cfg: dict, track: str) -> None:
                   "releases": [{
                       "name": f"{app['new_version']} ({version_code})",
                       "versionCodes": [str(version_code)],
-                      "status": "draft",
+                      # Live for testers on commit. Draft-state apps (never published) only
+                      # take "draft"; all apps passed :validate with "completed" 2026-10-02.
+                      "status": "completed",
                   }],
               }).encode(), content_type="application/json")
 
         play_commit(pkg, token, edit_id)
-        log(f"Draft release on '{track}' — review and promote it in the Play Console.")
+        record_shipped(app["key"], app["new_version"])
+        log(f"Released to '{track}' — testers get it once Play finishes processing.")
     except BaseException:
         play_edit_delete(pkg, token, edit_id)
         raise
 
     # Read back what Play actually accepted.
     verify_edit = play_edit_insert(pkg, play_token(cfg["PLAY_SERVICE_ACCOUNT"]))
-    accepted = play_highest_version_code(pkg, token, verify_edit)
+    accepted, _ = play_highest_version_code(pkg, token, verify_edit)
     play_edit_delete(pkg, token, verify_edit)
     log(f"Play now reports highest versionCode = {accepted}")
 
@@ -674,15 +745,19 @@ def ship_one(key: str, projects: dict, cfg: dict, args) -> dict:
     version, local_code, local_target = read_android_settings(repo)
 
     if args.no_upload:
-        play_code = 0
-        log("--no-upload: skipping the Play version-code query", "WARN")
+        play_code, play_name = 0, None
+        log("--no-upload: skipping the Play version query", "WARN")
     else:
         token = play_token(cfg["PLAY_SERVICE_ACCOUNT"])
         edit_id = play_edit_insert(app["package_name"], token)
         log(f"Querying Play for {app['package_name']}...")
-        play_code = play_highest_version_code(app["package_name"], token, edit_id)
+        play_code, play_name = play_highest_version_code(app["package_name"], token, edit_id)
         play_edit_delete(app["package_name"], token, edit_id)
-        log(f"Play highest versionCode = {play_code} (local = {local_code})")
+        log(f"Play highest versionCode = {play_code} (local = {local_code}), "
+            f"versionName = {play_name} (local = {version})")
+
+    # Bump from whichever is newer, or a ship after a reset tree reuses the last name.
+    version = ship.max_version(version, shipped_version(key, play_name))
 
     app["new_code"] = max(local_code, play_code) + 1
 

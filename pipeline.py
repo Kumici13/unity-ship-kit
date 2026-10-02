@@ -99,15 +99,16 @@ def prepare_clone(app: dict, branch: str) -> tuple[Path, str]:
 
 # ── Build number ──────────────────────────────────────────────────────────────
 
-def _store_highest(app: dict, platforms: list[str]) -> int:
-    """Highest build number Play / TestFlight know. A failed query is not fatal for a
-    QA build — the local counter still guarantees uniqueness."""
-    best = 0
+def _store_highest(app: dict, platforms: list[str]) -> tuple[int, str | None]:
+    """Highest build number Play / TestFlight know, plus Play's newest versionName. A failed
+    query is not fatal for a QA build — the local counter still guarantees uniqueness."""
+    best, name = 0, None
     if "android" in platforms and cfg.get("PLAY_SERVICE_ACCOUNT"):  # optional without Play
         try:
             token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"])
             edit = sa.play_edit_insert(app["package_name"], token)
-            best = max(best, sa.play_highest_version_code(app["package_name"], token, edit))
+            code, name = sa.play_highest_version_code(app["package_name"], token, edit)
+            best = max(best, code)
             sa.play_edit_delete(app["package_name"], token, edit)
         except SystemExit:
             log("Play query failed — continuing with local numbers only", "WARN")
@@ -117,20 +118,21 @@ def _store_highest(app: dict, platforms: list[str]) -> int:
             best = max(best, tf or 0)
         except SystemExit:
             log("TestFlight query failed — continuing with local numbers only", "WARN")
-    return best
+    return best, name
 
 
-def next_build_number(app: dict, clone: Path, platforms: list[str]) -> int:
+def next_build_number(app: dict, clone: Path, platforms: list[str]) -> tuple[int, str | None]:
+    """Build number, plus the newest versionName already shipped (see sa.shipped_version)."""
     counters = json.loads(COUNTERS.read_text()) if COUNTERS.exists() else {}
     _, repo_android, _ = sa.read_android_settings(str(clone))
     _, repo_ios = ship.read_project_settings(str(clone))
-    store = _store_highest(app, platforms)
+    store, play_name = _store_highest(app, platforms)
     n = max(store, counters.get(app["key"], 0), repo_android, repo_ios) + 1
     log(f"Build number {n} = max(store {store}, issued {counters.get(app['key'], 0)}, "
         f"repo {repo_android}/{repo_ios}) + 1")
     counters[app["key"]] = n
     COUNTERS.write_text(json.dumps(counters, indent=2))
-    return n
+    return n, sa.shipped_version(app["key"], play_name)
 
 
 # ── Unity ─────────────────────────────────────────────────────────────────────
@@ -173,6 +175,23 @@ def unity_phase(log_path: Path) -> str:
     return last[1] if tail.rfind(last[0]) >= 0 else "working"
 
 
+def scrub_secrets(folder: Path, env: dict) -> None:
+    """Unity dumps its environment into the log on a Gradle failure, and the CLI
+    copies it into provenance.json — mask the keystore passwords in both."""
+    # "android" is the public debug-keystore password and a word all over the logs.
+    secrets = [v for k, v in env.items()
+               if k.startswith("SHIPKIT_") and k.endswith("_PASS") and v and v != "android"]
+    for path in folder.glob("*"):
+        if not secrets or path.suffix not in (".log", ".json") or not path.is_file():
+            continue
+        text = path.read_text(errors="surrogateescape")
+        clean = text
+        for secret in secrets:
+            clean = clean.replace(secret, "***")
+        if clean != text:
+            path.write_text(clean, errors="surrogateescape")
+
+
 def unity_build(clone: Path, target: str, method: str, out: Path, args: list[str],
                 log_path: Path, env: dict | None = None) -> None:
     cmd = [UNITY_CLI, "build", str(clone), "--target", target, "--execute-method", method,
@@ -199,6 +218,7 @@ def unity_build(clone: Path, target: str, method: str, out: Path, args: list[str
             log(f"unity build result: {json.dumps(frame)[:500]}")
             cli_errors += [e.get("message", "") for e in frame.get("errors") or []]
     rc = proc.wait()
+    scrub_secrets(out.parent, env or {})
     if rc != 0:
         tail = []
         try:
@@ -251,7 +271,10 @@ def build_android(job, app, clone, version, n, art: Path) -> dict:
     args += ["-targetSdk", str(app.get("target_sdk", sa.TARGET_SDK)), "-keystore", app["keystore_path"],
              "-keyalias", app["key_alias"]]
     env = {**_ENV, "SHIPKIT_KEYSTORE_PASS": app["keystore_pass"],
-           "SHIPKIT_KEYALIAS_PASS": app["keyalias_pass"]}
+           "SHIPKIT_KEYALIAS_PASS": app["keyalias_pass"],
+           # Own daemon registry: an editor build elsewhere ends with `gradle --stop`,
+           # which kills every daemon under the shared ~/.gradle — mid-build here.
+           "GRADLE_USER_HOME": str(WORK / "gradle-home")}
 
     if not job.get("dev"):
         strip_debuggable(clone)
@@ -348,6 +371,9 @@ def build_ios(job, app, clone, version, n, art: Path) -> dict:
     run(["xcodebuild", "archive", *project, "-scheme", "Unity-iPhone",
          "-configuration", "Release", "-destination", "generic/platform=iOS",
          "-archivePath", str(archive), *auth,
+         # Own DerivedData per build: the default ~/Library one gets a new ~7 GB dir per
+         # build (fresh Xcode project path each time) and is never cleaned up.
+         "-derivedDataPath", str(art / "DerivedData"),
          f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_STYLE=Automatic"])
 
     plist = art / "ExportOptions.plist"
@@ -359,6 +385,7 @@ def build_ios(job, app, clone, version, n, art: Path) -> dict:
 
     shutil.rmtree(xdir, ignore_errors=True)   # multi-GB; the archive is on Apple now
     shutil.rmtree(archive, ignore_errors=True)
+    shutil.rmtree(art / "DerivedData", ignore_errors=True)
 
     what = f"{job['branch']}@{job['sha']}" + "".join(
         f" [{t.upper()}]" for t in ("dev", "cheats") if job.get(t))
@@ -612,7 +639,10 @@ def build(job: dict) -> dict:
     job["sha"] = sha
     changes = changelog(clone, job.get("since"))
     version = sa.read_android_settings(str(clone))[0]
-    n = next_build_number(app, clone, platforms)
+    n, shipped = next_build_number(app, clone, platforms)
+    if shipped and ship.version_tuple(shipped) >= ship.version_tuple(version):
+        log(f"versionName {version} is not past {shipped} (already shipped) — using the next one")
+        version = ship.bump_version(shipped)
     progress(f"{app['key']} {version} ({n}) from {job['branch']}@{sha}")
 
     art = WORK / "artifacts" / job["id"]
@@ -634,7 +664,7 @@ def changelog(clone: Path, since: str | None, limit: int = 20) -> list[str]:
 
 
 def upload(job: dict) -> dict:
-    """Push the AAB kept from an earlier build to Play internal (draft)."""
+    """Push the AAB kept from an earlier build to Play internal (released, not draft)."""
     app = resolve(job)
     aabs = sorted((WORK / "artifacts" / job["id"]).glob("*.aab"))
     if not aabs:
@@ -646,7 +676,7 @@ def upload(job: dict) -> dict:
             hint="Play upload needs a Google Play service account (SETUP.md → Step 4).")
     token = sa.play_token(cfg["PLAY_SERVICE_ACCOUNT"])
     edit = sa.play_edit_insert(app["package_name"], token)
-    highest = sa.play_highest_version_code(app["package_name"], token, edit)
+    highest, _ = sa.play_highest_version_code(app["package_name"], token, edit)
     sa.play_edit_delete(app["package_name"], token, edit)
     if highest >= job["number"]:
         die(f"Play already has versionCode {highest} ≥ {job['number']}",
