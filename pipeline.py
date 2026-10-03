@@ -5,6 +5,7 @@ pipeline.py — one build job for bot.py: isolated clone → Unity → Drive / T
 Usage:
     pipeline.py build  '<job json>'   # {"id","game","platform","format","branch","dev","cheats"}
     pipeline.py upload '<job json>'   # {"id","game"} — push a kept AAB to Play internal
+    pipeline.py promote '<job json>'  # {"id","game","number"?} — internal release → production 100%
     pipeline.py prune                 # delete Drive + local artifacts older than RETENTION_DAYS
 
 Builds never touch the game repos in projects.json. Each game gets its own clone under
@@ -687,10 +688,20 @@ def upload(job: dict) -> dict:
     return {"track": "internal"}
 
 
+def promote(job: dict) -> dict:
+    """Copy the completed internal release to production at 100% (no re-upload)."""
+    app = resolve(job)
+    if not cfg.get("PLAY_SERVICE_ACCOUNT"):
+        die("PLAY_SERVICE_ACCOUNT not set in config.env", category="BAD CONFIG",
+            hint="Promote needs a Google Play service account (SETUP.md → Step 4).")
+    progress("Promoting internal release to production")
+    return sa.play_promote(app, cfg, expect_code=job.get("number"))
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     job = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
-    handler = {"build": build, "upload": upload, "prune": prune}.get(cmd)
+    handler = {"build": build, "upload": upload, "promote": promote, "prune": prune}.get(cmd)
     if not handler:
         sys.exit(__doc__)
 

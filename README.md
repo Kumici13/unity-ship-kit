@@ -116,6 +116,7 @@ When it finishes:
 - **💾 Drive**: normal Google Drive page, for downloading on a PC.
 - **🔁 Rebuild**: same settings, latest commit.
 - **📤 Upload to Play (internal)**: only on `format:aab` release builds (no dev, no cheats), because Play doesn't accept APKs. Sends that exact bundle to the Play Console internal track as a completed release (live for internal testers, no Console step).
+- **🚀 Promote to production**: on a ✅ internal upload. Asks to confirm, then copies that exact release (same versionCode and release notes) to the production track at 100%. Goes live after Google review. Refused if internal has moved on, or it's already on production.
 
 **If nothing changed since the last build**, the bot doesn't build again. It reposts the existing build (♻️) in about 2 seconds. Use `force:True` if you really need a fresh one.
 
@@ -128,6 +129,7 @@ When it finishes:
 | `/latest game:<game>` | Newest finished build (buttons + QR), visible only to you |
 | `/status` | What's building, what's queued, free disk space |
 | `/builds` | Last 10 builds with links |
+| `/promote game:<game>` | Push the game's latest 📤 internal upload to production (100%, asks to confirm; `UPLOAD_ROLE_ID`). No internal upload → refused |
 | `/abort` | Stop the build that's running |
 | `/cancel` | Remove a queued build |
 

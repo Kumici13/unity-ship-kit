@@ -185,8 +185,10 @@ def _play_transient(code: int, attempt: int, what: str) -> bool:
 
 def _play_hint(code: int) -> str | None:
     if code in (401, 403):
-        return ("Common causes: the service account lacks Release Manager on this app, "
-                "or the app has never had a manual release.")
+        return ("Common causes: the service account lacks the permission for this track on this "
+                "app (Play Console → Users and permissions: 'Release to testing tracks' for "
+                "internal, 'Release to production, exclude devices, and use Play App Signing' "
+                "for 🚀 promote), or the app has never had a manual release.")
     if code == 429 or code >= 500:
         return "Google Play API is unavailable — nothing was published. Re-run the build."
     return None
@@ -386,6 +388,41 @@ def play_upload(app: dict, aab: Path, cfg: dict, track: str) -> None:
     accepted, _ = play_highest_version_code(pkg, token, verify_edit)
     play_edit_delete(pkg, token, verify_edit)
     log(f"Play now reports highest versionCode = {accepted}")
+
+
+def play_promote(app: dict, cfg: dict, expect_code: int | None = None,
+                 src: str = "internal", dst: str = "production") -> dict:
+    """Copy the completed release on `src` to `dst` at 100% — same versionCode, no re-upload.
+    expect_code (from the 📤 upload job) refuses to promote if `src` has moved on since."""
+    section(f"[{app['key']}] Promoting {src} → {dst}")
+    pkg = app["package_name"]
+    token = play_token(cfg["PLAY_SERVICE_ACCOUNT"])
+    edit_id = play_edit_insert(pkg, token)
+    base = f"{PLAY_API}/applications/{pkg}/edits/{edit_id}/tracks"
+    try:
+        release = next((r for r in _http("GET", f"{base}/{src}", token).get("releases", [])
+                        if r.get("status") == "completed" and r.get("versionCodes")), None)
+        if not release:
+            die(f"No completed release on {src} for {pkg}", category="PROMOTE FAILED",
+                hint=f"Upload an AAB to {src} first (📤 button).")
+        codes = release["versionCodes"]
+        if expect_code and str(expect_code) not in codes:
+            die(f"{src} now has {release.get('name', codes)}, not versionCode {expect_code}",
+                hint="Promote the newer one from its message, or /promote.",
+                category="PROMOTE FAILED")
+        live = _http("GET", f"{base}/{dst}", token).get("releases", [])
+        if any(r.get("status") == "completed" and r.get("versionCodes") == codes for r in live):
+            die(f"{release.get('name', codes)} is already on {dst}", category="PROMOTE FAILED")
+
+        out = {k: release[k] for k in ("name", "versionCodes", "releaseNotes") if k in release}
+        _http("PUT", f"{base}/{dst}", token, content_type="application/json",
+              body=json.dumps({"track": dst, "releases": [{**out, "status": "completed"}]}).encode())
+        play_commit(pkg, token, edit_id)
+        log(f"Released {release.get('name', codes)} to '{dst}' at 100% (after Google review).")
+    except BaseException:
+        play_edit_delete(pkg, token, edit_id)
+        raise
+    return {"track": dst, "name": release.get("name", ""), "version_codes": codes}
 
 
 # ── ProjectSettings (read-only) ──────────────────────────────────────────────

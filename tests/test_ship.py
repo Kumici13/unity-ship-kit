@@ -1,4 +1,5 @@
 """python3 -m unittest discover tests"""
+import json
 import unittest
 from unittest import mock
 
@@ -32,6 +33,44 @@ class SelfBump(unittest.TestCase):
     def test_rejects_semver(self):
         with self.assertRaises(SystemExit):
             sa.self_bump_back({"key": "g"}, "1.2.3")
+
+
+class Promote(unittest.TestCase):
+    """play_promote copies internal's completed release to production, or refuses."""
+
+    def run_promote(self, internal, production, expect_code=None):
+        puts = []
+
+        def http(method, url, token, body=None, **kw):
+            if method == "PUT":
+                puts.append((url, json.loads(body)))
+                return {}
+            return {"releases": internal if url.endswith("/internal") else production}
+
+        with mock.patch.multiple(sa, play_token=mock.DEFAULT, play_edit_insert=mock.DEFAULT,
+                                 play_commit=mock.DEFAULT, play_edit_delete=mock.DEFAULT,
+                                 section=mock.DEFAULT, log=mock.DEFAULT, _http=http,
+                                 die=mock.Mock(side_effect=SystemExit(1))):
+            sa.play_promote({"key": "g", "package_name": "p"}, {"PLAY_SERVICE_ACCOUNT": "x"},
+                            expect_code=expect_code)
+        return puts
+
+    REL = {"name": "1.2 (42)", "versionCodes": ["42"], "status": "completed",
+           "releaseNotes": [{"language": "en-US", "text": "hi"}]}
+
+    def test_copies_internal_release_to_production(self):
+        puts = self.run_promote([self.REL], [], expect_code=42)
+        self.assertEqual(len(puts), 1)
+        url, body = puts[0]
+        self.assertTrue(url.endswith("/tracks/production"))
+        self.assertEqual(body["releases"], [{**self.REL, "status": "completed"}])
+
+    def test_refuses(self):
+        for internal, production, code in (([], [], None),                 # nothing on internal
+                                           ([self.REL], [self.REL], None),  # already live
+                                           ([self.REL], [], 41)):           # internal moved on
+            with self.subTest(code=code), self.assertRaises(SystemExit):
+                self.run_promote(internal, production, code)
 
 
 if __name__ == "__main__":

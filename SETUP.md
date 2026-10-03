@@ -70,7 +70,7 @@ Many ❌ are normal at this point. The next steps fix them one by one.
    ```
    In `config.env`: `PLAY_SERVICE_ACCOUNT=~/.config/shipkit/service-account.json`
 3. Copy the service account's email (looks like `name@project.iam.gserviceaccount.com`).
-4. Using Play upload: https://play.google.com/console → **Users and permissions → Invite new users** → paste that email → under **App permissions** add your games → tick **Release to testing tracks** → **Invite user**.
+4. Using Play upload: https://play.google.com/console → **Users and permissions → Invite new users** → paste that email → under **App permissions** add your games → tick **Release to testing tracks** (📤 internal) and, for 🚀 promote, **Release to production, exclude devices, and use Play App Signing** → **Invite user**.
 
 **4.3 Where the builds go.** Pick **a** or **b**.
 

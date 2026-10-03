@@ -124,6 +124,8 @@ def mins(a: float | None, b: float | None = None) -> str:
 def headline(j: dict) -> str:
     if j["kind"] == "upload":
         return f"📤 **{j['game']}** {j['version']} ({j['number']}) → Play internal"
+    if j["kind"] == "promote":
+        return f"🚀 **{j['game']}** {j['version']} ({j['number']}) → Play production"
     what = j["platform"] + (f" {j['format']}" if j["platform"] != "ios" else "")
     flags = "".join(f" · {f}" for f in ("dev", "cheats", "clean") if j.get(f))
     who = f"<@{j['user_id']}>" if j.get("user_id") else "🌙 nightly"
@@ -160,6 +162,8 @@ def render(j: dict) -> str:
         r = j.get("result", {})
         if j["kind"] == "upload":
             lines.append("✅ Released on Play internal track")
+        elif j["kind"] == "promote":
+            lines.append(f"✅ {r.get('name', '')} sent to production (100%) — live after Google review")
         else:
             lines.append(f"✅ {r['version']} ({r['number']}) · `{j['branch']}@{r['sha']}` · "
                          f"{mins(j['started'], j['finished'])}")
@@ -192,6 +196,11 @@ def direct_link(drive_link: str) -> str:
 def result_view(j: dict) -> discord.ui.View | None:
     """Install / Drive link buttons, plus the Play upload button for release AABs."""
     r = j.get("result", {})
+    if j["kind"] == "upload" and j["status"] == "ok":
+        v = discord.ui.View(timeout=None)
+        v.add_item(discord.ui.Button(label="Promote to production", emoji="🚀",
+                                     style=discord.ButtonStyle.danger, custom_id=f"promote:{j['id']}"))
+        return v
     if j["kind"] != "build" or j["status"] in ("queued", "running"):
         return None
     v = discord.ui.View(timeout=None)
@@ -514,7 +523,7 @@ async def status(inter: discord.Interaction):
     r = running["job"]
     lines = [f"⚙️ #{r['id']} {r['game']}: {r.get('progress')} · {mins(r.get('started'))}"
              if r else "Idle."]
-    lines += [f"⏳ #{q['id']} {q['game']} {q.get('platform', 'upload')} `{q.get('branch', '')}`"
+    lines += [f"⏳ #{q['id']} {q['game']} {q.get('platform', q['kind'])} `{q.get('branch', '')}`"
               for q in queued()]
     lines.append(f"💾 {shutil.disk_usage(WORK).free // 1024**3} GB free")
     await inter.response.send_message("\n".join(lines), ephemeral=True)
@@ -560,7 +569,7 @@ async def abort(inter: discord.Interaction):
 
 
 async def queued_complete(inter: discord.Interaction, current: str):
-    return [app_commands.Choice(name=f"#{q['id']} {q['game']} {q.get('platform', 'upload')}", value=q["id"])
+    return [app_commands.Choice(name=f"#{q['id']} {q['game']} {q.get('platform', q['kind'])}", value=q["id"])
             for q in queued() if current in q["id"]][:25]
 
 
@@ -595,9 +604,12 @@ async def on_interaction(inter: discord.Interaction):
     cid = (inter.data or {}).get("custom_id", "")
     if inter.type != discord.InteractionType.component:
         return
-    if not cid.startswith(("rebuild:", "upload:")):
+    if not cid.startswith(("rebuild:", "upload:", "promote:", "confirm-promote:")):
         return
-    if await wrong_channel(inter, UPLOAD_ROLE if cid.startswith("upload:") else 0):
+    if await wrong_channel(inter, 0 if cid.startswith("rebuild:") else UPLOAD_ROLE):
+        return
+    if cid.startswith(("promote:", "confirm-promote:")):
+        await on_promote(inter, cid)
         return
     if cid.startswith("rebuild:"):
         old = find(cid.split(":", 1)[1])
@@ -626,6 +638,61 @@ async def on_interaction(inter: discord.Interaction):
         allowed_mentions=discord.AllowedMentions.none())).id
     enqueue(j)
     await refresh(j)
+
+
+def confirm_promote(target: str) -> discord.ui.View:
+    v = discord.ui.View(timeout=300)
+    v.add_item(discord.ui.Button(label="Yes, push to production", emoji="🚀",
+                                 style=discord.ButtonStyle.danger, custom_id=f"confirm-promote:{target}"))
+    return v
+
+
+async def on_promote(inter: discord.Interaction, cid: str) -> None:
+    """promote:<upload id> asks first; confirm-promote:<upload id> queues it.
+    Only a ✅ bot upload to internal can be promoted; Play re-checks internal still has it."""
+    confirm, target = cid.startswith("confirm-"), cid.split(":", 1)[1]
+    parent = find(target)
+    if not parent or parent["kind"] != "upload" or parent["status"] != "ok":
+        await inter.response.send_message("That upload is gone.", ephemeral=True)
+        return
+    game, what = parent["game"], f"{parent['version']} ({parent['number']})"
+    if not confirm:
+        await inter.response.send_message(
+            f"Push **{game}** {what} to **production**, 100% of users, after Google review? "
+            "Can't be undone from here.", view=confirm_promote(target), ephemeral=True)
+        return
+    if any(j.get("parent") == parent["id"] and j["kind"] == "promote"
+                      and j["status"] in ("queued", "running", "ok") for j in state["jobs"]):
+        await inter.response.send_message("Already promoted or queued.", ephemeral=True)
+        return
+    j = {"id": new_id(), "kind": "promote", "parent": parent["id"], "game": game,
+         "version": parent["version"], "number": parent["number"],
+         "user_id": inter.user.id, "status": "queued", "created": time.time()}
+    await inter.response.edit_message(content=f"Queued production promote #{j['id']}.", view=None)
+    j["message_id"] = (await client.get_channel(CHANNEL_ID).send(
+        "…", allowed_mentions=discord.AllowedMentions.none())).id
+    enqueue(j)
+    await refresh(j)
+
+
+@tree.command(guild=guild, name="promote",
+              description="Push a game's latest internal upload to production (100%)")
+@app_commands.describe(game="Game")
+@app_commands.autocomplete(game=game_complete)
+async def promote(inter: discord.Interaction, game: str):
+    if await wrong_channel(inter, UPLOAD_ROLE):
+        return
+    if game not in projects():
+        await inter.response.send_message(f"Unknown game `{game}`. Pick one from the list.", ephemeral=True)
+        return
+    up = next((j for j in reversed(state["jobs"])
+               if j["kind"] == "upload" and j["game"] == game and j["status"] == "ok"), None)
+    if not up:
+        await inter.response.send_message(
+            f"No internal upload of `{game}` yet. Build `format:aab`, press 📤 Upload to Play "
+            "(internal), test it, then promote.", ephemeral=True)
+        return
+    await on_promote(inter, f"promote:{up['id']}")
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
