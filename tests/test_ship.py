@@ -98,3 +98,66 @@ class ShippedVersion(unittest.TestCase):
         self.assertEqual(sa.shipped_version("g", "0.70"), "0.70")
         self.assertEqual(sa.shipped_version("g", None), "0.64")
         self.assertIsNone(sa.shipped_version("other", None))
+
+
+class GameEntry(unittest.TestCase):
+    SETTINGS = ("  productName: X\n  applicationIdentifier:\n    Android: com.example.game\n"
+                "    Standalone: com.Unity-Technologies.blank\n    iPhone: {ios}\n  buildNumber:\n")
+
+    def test_android_only_when_ios_is_template(self):
+        e = ship.game_entry(self.SETTINGS.format(ios="com.Unity-Technologies.blank"), "~/r", "main", "oox", "k")
+        self.assertEqual((e["package_name"], e["platforms"], e["nightly"]), ("com.example.game", ["android"], False))
+        self.assertNotIn("bundle_id", e)
+
+    def test_ios_bundle_id(self):
+        e = ship.game_entry(self.SETTINGS.format(ios="com.example.gameios"), "~/r", "main", "oox", "k")
+        self.assertEqual(e["bundle_id"], "com.example.gameios")
+        self.assertNotIn("platforms", e)
+
+    def test_no_android_id_refused(self):
+        with self.assertRaises(ValueError):
+            ship.game_entry("  productName: X\n", "~/r", "main", "oox", "k")
+
+
+class CommitVersionBack(unittest.TestCase):
+    def test_pushes_to_origin_and_leaves_the_checkout_alone(self):
+        import os, subprocess, tempfile
+        from pathlib import Path
+        env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, env):
+            git = lambda *a, cwd=tmp: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True).stdout
+            git("init", "-q", "--bare", "remote.git")
+            repo = Path(tmp) / "repo"
+            settings = repo / "ProjectSettings" / "ProjectSettings.asset"
+            settings.parent.mkdir(parents=True)
+            settings.write_text("  bundleVersion: 0.63\n  AndroidBundleVersionCode: 54\n")
+            git("init", "-q", "-b", "main", cwd=repo)
+            git("add", "-A", cwd=repo)
+            git("commit", "-qm", "settings", cwd=repo)
+            git("remote", "add", "origin", str(Path(tmp) / "remote.git"), cwd=repo)
+            git("push", "-q", "origin", "main", cwd=repo)
+            # The user is elsewhere: another branch, unsaved edits in the same file.
+            git("checkout", "-q", "-b", "feature", cwd=repo)
+            settings.write_text("  bundleVersion: 0.63\n  AndroidBundleVersionCode: 54\n  wip: 1\n")
+            app = {"repo_path": str(repo), "branch": "main", "key": "t"}
+            sa.commit_version_back(app, "0.70", 69)
+            on_origin = git("show", "main:ProjectSettings/ProjectSettings.asset", cwd=Path(tmp) / "remote.git")
+            self.assertIn("bundleVersion: 0.70", on_origin)
+            self.assertIn("AndroidBundleVersionCode: 69", on_origin)
+            self.assertIn("wip: 1", settings.read_text())
+            self.assertEqual(git("branch", "--show-current", cwd=repo).strip(), "feature")
+            sa.commit_version_back(app, "0.69", 70)  # older name: never moves backwards
+            self.assertIn("bundleVersion: 0.70", git("show", "main:ProjectSettings/ProjectSettings.asset", cwd=Path(tmp) / "remote.git"))
+            self.assertEqual(git("worktree", "list", cwd=repo).count("\n"), 1)  # temp worktree removed
+
+
+class IosSettingsWrite(unittest.TestCase):
+    def test_version_and_iphone_build(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "ProjectSettings" / "ProjectSettings.asset"
+            f.parent.mkdir()
+            f.write_text("  bundleVersion: 0.63\n  buildNumber:\n    Standalone: 0\n    iPhone: 12\n    tvOS: 0\n")
+            ship.write_project_settings(tmp, "0.71", 13)
+            self.assertEqual(ship.read_project_settings(tmp), ("0.71", 13))

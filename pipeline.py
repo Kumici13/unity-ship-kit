@@ -243,6 +243,9 @@ def common_args(job: dict, app: dict, version: str, n: int) -> list[str]:
         if not app.get("cheat_defines"):
             die(f"[{app['key']}] has no cheat_defines in projects.json", category="BAD CONFIG")
         args += ["-defineAdd", ",".join(app["cheat_defines"])]
+    elif app.get("cheat_defines"):
+        # Some repos bake cheat defines into PlayerSettings; strip them.
+        args += ["-defineRemove", ",".join(app["cheat_defines"])]
     if app.get("prebuild_method"):
         args += ["-prebuildMethod", app["prebuild_method"]]
     return args
@@ -495,10 +498,30 @@ def _drive(method: str, url: str, token: str, body: bytes | None = None,
     h = {"Authorization": f"Bearer {token}", **(headers or {})}
     if ctype:
         h["Content-Type"] = ctype
-    req = urllib.request.Request(url, data=body, headers=h, method=method)
     ctx = ssl.create_default_context(cafile=certifi.where())
+    # Google's 5xx / dropped connections are transient (build 176: one 500 on the APK PUT
+    # after 123 good uploads); its docs say retry with backoff. A file body is rewound.
+    err = None
+    for wait in (5, 15, 45, None):
+        if hasattr(body, "seek"):
+            body.seek(0)
+        req = urllib.request.Request(url, data=body, headers=h, method=method)
+        try:
+            r = urllib.request.urlopen(req, timeout=1800, context=ctx)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or wait is None:
+                err = e
+                break
+            log(f"Drive API {e.code} on {method}, retrying in {wait} s", "WARN")
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            if wait is None:
+                die(f"Drive {method} {url.split('?')[0]} failed: {e}", category="DRIVE FAILED")
+            log(f"Drive {method} failed ({e}), retrying in {wait} s", "WARN")
+        time.sleep(wait)
     try:
-        r = urllib.request.urlopen(req, timeout=1800, context=ctx)
+        if err:
+            raise err
         if raw:
             return r
         data = r.read()

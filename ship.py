@@ -9,7 +9,8 @@ Steps:
     1. Pre-flight: validate branch exists on origin
     2. git checkout <branch>
     3. Query App Store Connect for latest TestFlight build number
-    4. Bump bundleVersion + iOS buildNumber in ProjectSettings.asset
+    4. Bump bundleVersion + iOS buildNumber in ProjectSettings.asset (committed + pushed after
+       a successful upload, so the repo never lags TestFlight; COMMIT_VERSION=0 opts out)
     5. Optionally patch arbitrary asset YAML fields (--asset-patch)
     6. Optionally mutate iOS scripting defines (--define)
     7. Run Unity in batch mode → generate Xcode project
@@ -25,6 +26,7 @@ import re
 import json
 import time
 import shutil
+import tempfile
 import signal
 import subprocess
 import urllib.request
@@ -251,6 +253,23 @@ def read_project_settings(repo_path: str) -> tuple[str, int]:
     log(f"Current ProjectSettings: version={current_version}, build={current_build}")
     return current_version, current_build
 
+def game_entry(settings: str, repo_path: str, branch: str, keystore: str, key_alias: str) -> dict:
+    """projects.json entry from a ProjectSettings.asset text. iOS only when its bundle id
+    is set (not the Unity template / DefaultCompany placeholder)."""
+    block = re.search(r"applicationIdentifier:\r?\n((?:    .*\n)*)", settings)
+    ids = dict(re.findall(r"^    (Android|iPhone): (\S+)", block.group(1) if block else "", re.M))
+    if not ids.get("Android"):
+        raise ValueError("no Android applicationIdentifier in ProjectSettings.asset")
+    entry = {"repo_path": repo_path, "branch": branch, "package_name": ids["Android"],
+             "keystore": keystore, "key_alias": key_alias,
+             "nightly": False}  # ponytail: opt in by hand, or every added game builds at night
+    ios = ids.get("iPhone", "")
+    if ios and "Unity-Technologies" not in ios and "DefaultCompany" not in ios:
+        entry["bundle_id"] = ios
+    else:
+        entry["platforms"] = ["android"]
+    return entry
+
 def bump_version(version: str) -> str:
     parts = version.split(".")
     try: parts[-1] = str(int(parts[-1]) + 1)
@@ -319,6 +338,41 @@ def apply_asset_patches(repo_path: str, patches: list[tuple[str, str, str]]) -> 
         log(f"Patched {rel}: {field}={val}")
         touched.append(rel)
     return touched
+
+SETTINGS = "ProjectSettings/ProjectSettings.asset"
+
+def commit_settings(repo_path: str, branch: str, version: str, build: int, store: str, write) -> bool:
+    """Commit the shipped version to origin/<branch> and push, so the repo never lags the store.
+    Works in a temporary worktree of origin/<branch>: the user's checkout (any branch, dirty,
+    behind) is never touched. `write(root)` writes the numbers into root's ProjectSettings.asset.
+    Never moves bundleVersion backwards. A failure only warns: the upload already succeeded."""
+    def git(*args, cwd=repo_path):
+        return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, env=_ENV)
+    tmp = Path(tempfile.mkdtemp(prefix="shipkit-version-"))
+    try:
+        for args in (("fetch", "origin", branch), ("worktree", "add", "--detach", str(tmp), f"origin/{branch}")):
+            r = git(*args)
+            if r.returncode != 0:
+                break
+        else:
+            current, _ = read_project_settings(str(tmp))
+            if version_tuple(current) > version_tuple(version):
+                log(f"origin/{branch} already at {current} > {version}: not committing", "WARN")
+                return False
+            write(str(tmp))
+            for args in (("commit", "-m", f"Version {version} ({build}): shipped to {store}", "--", SETTINGS),
+                         ("push", "origin", f"HEAD:{branch}")):
+                r = git(*args, cwd=tmp)
+                if r.returncode != 0:
+                    break
+            else:
+                log(f"origin/{branch} now at {version} ({build}), pushed. `git pull` before the next local build.")
+                return True
+        log(f"git {args[0]} failed — set {SETTINGS} on {branch} by hand: {version} ({build})\n{r.stderr.strip()}", "WARN")
+        return False
+    finally:
+        git("worktree", "remove", "--force", str(tmp))
+        shutil.rmtree(tmp, ignore_errors=True)
 
 def restore_assets(repo_path: str, asset_paths: list[str]) -> None:
     if not asset_paths: return
@@ -677,6 +731,9 @@ def main() -> None:
         else:
             section("5/5  Xcode archive + TestFlight upload")
             archive_and_upload(cfg, actual_version, actual_build)
+            if cfg.get("COMMIT_VERSION", "1") != "0":
+                commit_settings(cfg["REPO_PATH"], branch, actual_version, actual_build, "TestFlight",
+                                lambda root: write_project_settings(root, actual_version, actual_build))
 
         elapsed = int(time.time() - start)
         section("DONE")

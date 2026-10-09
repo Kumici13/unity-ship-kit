@@ -8,6 +8,7 @@ Slash commands (only in BUILD_CHANNEL_ID, anyone there may use all of them):
     /builds     last 10 builds
     /abort      kill the running build
     /cancel     drop a queued build
+    /addgame    add a Unity repo (autocomplete scans REPOS_DIR + GITHUB_ORG)
 
 One job runs at a time (one Unity per machine is plenty); the rest wait in a queue that
 survives restarts (WORK_DIR/builds.json). Each job is `pipeline.py` in its own process
@@ -52,6 +53,7 @@ WORK = Path(cfg.get("WORK_DIR", "~/ShipKit")).expanduser()
 WORK.mkdir(parents=True, exist_ok=True)
 STATE = WORK / "builds.json"
 LOGS = WORK / "logs"
+INBOX = WORK / "inbox"  # local agents (Claude Code) drop build requests here
 
 for key, val in (("DISCORD_TOKEN", TOKEN), ("DISCORD_GUILD_ID", GUILD_ID),
                  ("BUILD_CHANNEL_ID", CHANNEL_ID)):
@@ -128,7 +130,8 @@ def headline(j: dict) -> str:
         return f"🚀 **{j['game']}** {j['version']} ({j['number']}) → Play production"
     what = j["platform"] + (f" {j['format']}" if j["platform"] != "ios" else "")
     flags = "".join(f" · {f}" for f in ("dev", "cheats", "clean") if j.get(f))
-    who = f"<@{j['user_id']}>" if j.get("user_id") else "🌙 nightly"
+    who = (f"<@{j['user_id']}>" if j.get("user_id")
+           else "🤖 Claude (no hands, all builds)" if j.get("from_inbox") else "🌙 nightly")
     note = f"\n🏷️ {j['note']}" if j.get("note") else ""
     return f"🔨 **{j['game']}** {what} · `{j['branch']}`{flags} — #{j['id']} by {who}{note}"
 
@@ -213,7 +216,11 @@ def result_view(j: dict) -> discord.ui.View | None:
     v.add_item(discord.ui.Button(label="Drive", emoji="💾", url=a["link"]))
     # Play only takes AABs, and never dev/cheat builds.
     if j.get("format") == "aab" and not (j.get("dev") or j.get("cheats")):
-        v.add_item(discord.ui.Button(label="Upload to Play (internal)", emoji="📤",
+        up = next((u for u in reversed(state["jobs"]) if u.get("parent") == j["id"]
+                   and u["status"] in ("queued", "running", "ok")), None)
+        label = ("Upload to Play (internal)" if not up
+                 else "Uploaded to Play" if up["status"] == "ok" else "Uploading to Play…")
+        v.add_item(discord.ui.Button(label=label, emoji="📤", disabled=bool(up),
                                      style=discord.ButtonStyle.primary, custom_id=f"upload:{j['id']}"))
     return v
 
@@ -342,6 +349,8 @@ async def run_job(j: dict) -> None:
         j["status"] = "ok" if result and result.get("ok") else "failed"
     save()
     await refresh(j, result_view(j), install_qr(j))
+    if j["kind"] == "upload" and (parent := find(j["parent"])):
+        await refresh(parent, result_view(parent))
 
     msg = channel.get_partial_message(j["message_id"])
     if j["status"] == "failed":
@@ -350,8 +359,10 @@ async def run_job(j: dict) -> None:
         await thread.send(f"**{r.get('category')}**: {r.get('message', '')[:1500]}\n"
                           f"```\n{(r.get('hint') or '')[-1500:]}\n```",
                           file=discord.File(log_path))
+    if j["status"] == "ok" and j["kind"] == "build" and j.get("auto_upload"):
+        await queue_upload(j, reference=msg)
     if j["status"] in ("ok", "failed"):
-        who = f"<@{j['user_id']}>" if j.get("user_id") else "🌙"
+        who = f"<@{j['user_id']}>" if j.get("user_id") else "🤖 Claude" if j.get("from_inbox") else "🌙"
         await channel.send(f"{who} #{j['id']} {j['game']} {ICON[j['status']]}",
                            reference=msg, mention_author=False)
 
@@ -379,6 +390,54 @@ def enqueue(j: dict) -> None:
     state["jobs"] = state["jobs"][-500:]
     save()
     wake.set()
+
+
+async def queue_upload(parent: dict, user_id: int | None = None, reference=None) -> dict:
+    """Queue a Play internal upload of a finished AAB build (inbox auto_upload)."""
+    r = parent["result"]
+    j = {"id": new_id(), "kind": "upload", "parent": parent["id"], "game": parent["game"],
+         "version": r["version"], "number": r["number"], "user_id": user_id or parent.get("user_id"),
+         "status": "queued", "created": time.time()}
+    j["message_id"] = (await client.get_channel(CHANNEL_ID).send(
+        "…", reference=reference, mention_author=False,
+        allowed_mentions=discord.AllowedMentions.none())).id
+    enqueue(j)
+    await refresh(j)
+    await refresh(parent, result_view(parent))
+    return j
+
+
+@tasks.loop(seconds=10)
+async def inbox():
+    """INBOX/*.json: {"game", "branch"?, "format"?, "dev"?, "cheats"?, "note"?, "upload"?, "force"?}
+    or {"upload_of": "<build id>"}.
+    Same queue and Discord cards as /build; the reply lands in <name>.done next to it."""
+    INBOX.mkdir(parents=True, exist_ok=True)
+    for f in sorted(INBOX.glob("*.json")):
+        try:
+            req = json.loads(f.read_text())
+            if req.get("upload_of"):  # Play internal upload of an earlier ✅ AAB build, e.g. after a 403 fix
+                parent = find(str(req["upload_of"]))
+                if not parent or parent["status"] != "ok" or parent.get("format") != "aab":
+                    raise ValueError(f"build #{req['upload_of']} is not a finished AAB build")
+                msg = f"Queued upload #{(await queue_upload(parent))['id']}."
+                f.with_suffix(".done").write_text(msg + "\n")
+                f.unlink()
+                continue
+            conf = projects()[req["game"]]
+            upload = bool(req.get("upload"))
+            if upload and (req.get("format", "aab") != "aab" or req.get("dev") or req.get("cheats")):
+                raise ValueError("upload needs a release AAB (format aab, no dev, no cheats)")
+            params = {"game": req["game"], "platform": "android",
+                      "format": req.get("format", "aab" if upload else "apk"),
+                      "branch": req.get("branch") or conf["branch"], "dev": bool(req.get("dev")),
+                      "cheats": bool(req.get("cheats")), "note": (req.get("note") or "")[:80] or None,
+                      "clean": False, "auto_upload": upload, "from_inbox": True}
+            msg = await submit(params, None, force=bool(req.get("force")))
+        except Exception as e:  # a bad file must not stop the loop
+            msg = f"rejected: {type(e).__name__}: {e}"
+        f.with_suffix(".done").write_text(msg + "\n")
+        f.unlink()
 
 
 def new_id() -> str:
@@ -415,12 +474,20 @@ async def game_complete(inter: discord.Interaction, current: str):
             if current.lower() in k.lower()][:25]
 
 
+_fetched: dict[str, float] = {}
+
+
 async def branch_complete(inter: discord.Interaction, current: str):
     game = projects().get(inter.namespace.game or "")
     if not game:
         return []
     clone = WORK / "work" / inter.namespace.game
     repo = clone if (clone / ".git").exists() else Path(game["repo_path"]).expanduser()
+    # Background fetch (max once a minute per repo) so new origin branches show on the next keystroke.
+    if time.time() - _fetched.get(str(repo), 0) > 60:
+        _fetched[str(repo)] = time.time()
+        subprocess.Popen(["git", "-C", str(repo), "fetch", "--prune", "--quiet", "origin"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     out = subprocess.run(["git", "-C", str(repo), "for-each-ref", "--sort=-committerdate",
                           "--format=%(refname:lstrip=3)", "refs/remotes/origin"],
                          capture_output=True, text=True, timeout=2).stdout.split()
@@ -589,6 +656,93 @@ async def cancel(inter: discord.Interaction, build: str):
     await refresh_queue()
 
 
+REPOS_DIR = Path(cfg.get("REPOS_DIR", "~/Documents/GitHub")).expanduser()
+GITHUB_ORG = cfg.get("GITHUB_ORG")
+_org_cache: tuple[float, list[str]] = (0.0, [])
+
+
+def org_repos() -> list[str]:
+    """C#/ShaderLab repos in GITHUB_ORG (packages too — /addgame checks for ProjectSettings).
+    Cached 10 min so autocomplete stays under Discord's 3 s."""
+    global _org_cache
+    if GITHUB_ORG and time.time() - _org_cache[0] > 600:
+        out = subprocess.run(["gh", "repo", "list", GITHUB_ORG, "--limit", "500", "--no-archived",
+                              "--json", "name,primaryLanguage", "--jq",
+                              '.[] | select(.primaryLanguage.name | IN("C#", "ShaderLab")) | .name'],
+                             capture_output=True, text=True, timeout=30)
+        _org_cache = (time.time(), out.stdout.split() if out.returncode == 0 else _org_cache[1])
+    return _org_cache[1]
+
+
+async def repo_complete(inter: discord.Interaction, current: str):
+    """Scan: Unity repos in REPOS_DIR + GITHUB_ORG that are not in projects.json yet."""
+    local = [d.name for d in REPOS_DIR.glob("*") if (d / "ProjectSettings" / "ProjectVersion.txt").exists()]
+    taken = {Path(c["repo_path"]).name for c in projects().values()}
+    names = sorted(set(local) | set(await asyncio.to_thread(org_repos)) - taken)
+    return [app_commands.Choice(name=n, value=n) for n in names if current.lower() in n.lower()][:25]
+
+
+def register(repo: str, name: str | None, key_alias: str | None) -> tuple[str, dict]:
+    """Find or clone `repo`, read its ProjectSettings and add it to projects.json."""
+    repo = repo.strip().removesuffix(".git").rstrip("/").rsplit("/", 1)[-1]
+    key = (name or repo).strip().lower()
+    for s in (repo, key):
+        if not s or s.startswith(("-", ".")) or not all(c.isalnum() or c in "-_." for c in s):
+            raise ValueError(f"bad name `{s}`")
+    p = projects()
+    if key in p:
+        raise ValueError(f"`{key}` is already in projects.json")
+    if dup := next((k for k, c in p.items() if Path(c["repo_path"]).name == repo), None):
+        raise ValueError(f"`{repo}` is already added as `{dup}`")
+    path = REPOS_DIR / repo
+    if not (path / ".git").exists():
+        path = WORK / "repos" / repo  # metadata-only clone; builds use their own clone in WORK/work
+        if not (path / ".git").exists():
+            if not GITHUB_ORG:
+                raise ValueError(f"not in {REPOS_DIR} and GITHUB_ORG is not set in config.env")
+            r = subprocess.run(["gh", "repo", "clone", f"{GITHUB_ORG}/{repo}", str(path), "--",
+                                "--no-checkout", "--filter=blob:none"],
+                               capture_output=True, text=True, timeout=600)
+            if r.returncode:
+                raise ValueError(f"clone failed: {ship.redact(r.stderr.strip()[-300:])}")
+    git = lambda *a: subprocess.run(["git", "-C", str(path), *a], capture_output=True, text=True, timeout=120)
+    head = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD").stdout.strip() or "origin/main"
+    settings = git("show", f"{head}:ProjectSettings/ProjectSettings.asset")
+    if settings.returncode:
+        raise ValueError(f"no ProjectSettings/ProjectSettings.asset on {head} — not a Unity game?")
+    # Same keystore + alias as most games; override key_alias before the first Play upload.
+    signed = [(c["keystore"], c["key_alias"]) for c in p.values() if c.get("keystore") and c.get("key_alias")]
+    keystore, alias = max(set(signed), key=signed.count) if signed else ("main", "")
+    entry = ship.game_entry(settings.stdout, str(path).replace(str(Path.home()), "~", 1),
+                            head.removeprefix("origin/"), keystore, key_alias or alias)
+    p[key] = entry
+    tmp = PROJECTS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(p, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(PROJECTS)
+    return key, entry
+
+
+@tree.command(guild=guild, name="addgame", description="Add a Unity repo to /build (list shows repos not added yet)")
+@app_commands.describe(repo="Repo name in REPOS_DIR or the GitHub org",
+                       name="Name in /build (default: repo name)",
+                       key_alias="Signing key alias (default: the one most games use)")
+@app_commands.autocomplete(repo=repo_complete)
+async def addgame(inter: discord.Interaction, repo: str, name: str | None = None, key_alias: str | None = None):
+    if await wrong_channel(inter, UPLOAD_ROLE):
+        return
+    await inter.response.defer(ephemeral=True, thinking=True)
+    try:
+        key, e = await asyncio.to_thread(register, repo, name, key_alias)
+    except (ValueError, subprocess.SubprocessError) as err:
+        await inter.followup.send(f"Could not add `{repo}`: {err}", ephemeral=True)
+        return
+    ios = f"iOS `{e['bundle_id']}`" if "bundle_id" in e else "Android only"
+    await inter.followup.send(
+        f"✅ Added **{key}** — branch `{e['branch']}`, `{e['package_name']}`, {ios}, "
+        f"key `{e['keystore']}/{e['key_alias']}`.\nNo cheats or nightly yet: add `cheat_defines` / "
+        f"`\"nightly\": true` in projects.json if needed.", ephemeral=True)
+
+
 @tree.error
 async def on_command_error(inter: discord.Interaction, error: app_commands.AppCommandError):
     """Answer instead of leaving the user on "is thinking…" forever."""
@@ -627,6 +781,7 @@ async def on_interaction(inter: discord.Interaction):
     if any(j.get("parent") == parent["id"] and j["status"] in ("queued", "running", "ok")
            for j in state["jobs"]):
         await inter.response.send_message("Already uploaded or queued.", ephemeral=True)
+        await refresh(parent, result_view(parent))
         return
     r = parent["result"]
     j = {"id": new_id(), "kind": "upload", "parent": parent["id"], "game": parent["game"],
@@ -638,6 +793,7 @@ async def on_interaction(inter: discord.Interaction):
         allowed_mentions=discord.AllowedMentions.none())).id
     enqueue(j)
     await refresh(j)
+    await refresh(parent, result_view(parent))
 
 
 def confirm_promote(target: str) -> discord.ui.View:
@@ -740,7 +896,9 @@ async def on_ready():
     print(f"Synced {len(cmds)} command(s) to guild {GUILD_ID}.", flush=True)
     prune_drive.start()
     nightly.start()
+    inbox.start()
     asyncio.create_task(worker())
+    asyncio.create_task(asyncio.to_thread(org_repos))  # warm /addgame autocomplete
     wake.set()
 
 

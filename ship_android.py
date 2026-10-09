@@ -304,9 +304,9 @@ def play_highest_version_code(pkg: str, token: str, edit_id: str) -> tuple[int, 
     """Highest versionCode Play knows about — uploaded bundles AND anything in a track —
     plus the highest versionName among track releases (release names are "<name> (<code>)").
 
-    Local ProjectSettings.asset routinely lags production (the bot resets the tree after
-    a build, so a bumped bundleVersion is never committed), so these are the numbers
-    that matter. bundles.list covers drafts and superseded uploads that tracks.list omits.
+    Local ProjectSettings.asset can lag production (the bot resets the tree after a build;
+    commit_version_back only catches up after a successful upload, and only from now on),
+    so these are the numbers that matter. bundles.list covers drafts and superseded uploads that tracks.list omits.
     """
     codes = []
     name = None
@@ -379,6 +379,8 @@ def play_upload(app: dict, aab: Path, cfg: dict, track: str) -> None:
         play_commit(pkg, token, edit_id)
         record_shipped(app["key"], app["new_version"])
         log(f"Released to '{track}' — testers get it once Play finishes processing.")
+        if app.get("commit_version", True):
+            commit_version_back(app, app["new_version"], version_code)
     except BaseException:
         play_edit_delete(pkg, token, edit_id)
         raise
@@ -440,6 +442,21 @@ def read_android_settings(repo_path: str) -> tuple[str, int, int]:
     log(f"ProjectSettings: version={version} versionCode={code} "
         f"targetSdk={target if target else 'auto'}")
     return version, code, target
+
+
+def commit_version_back(app: dict, version: str, code: int) -> None:
+    """Write the shipped versionName/versionCode into the game repo, commit and push.
+    On for every app (`"commit_version": false` in projects.json opts out): without it the repo
+    keeps its old numbers, so local APKs are refused as downgrades and web builds show a stale
+    version (e.g. repo 0.63 (54), Play 0.70 (69)).
+    The upload already succeeded, so a failure here only warns."""
+    def write(root: str) -> None:
+        path = Path(root) / ship.SETTINGS
+        text = path.read_text()
+        text = re.sub(r"^(\s*bundleVersion:).*$", rf"\g<1> {version}", text, count=1, flags=re.MULTILINE)
+        text = re.sub(r"^(\s*AndroidBundleVersionCode:).*$", rf"\g<1> {code}", text, count=1, flags=re.MULTILINE)
+        path.write_text(text)
+    ship.commit_settings(app["repo_path"], app["branch"], version, code, "Play", write)
 
 
 # ── Unity build ──────────────────────────────────────────────────────────────

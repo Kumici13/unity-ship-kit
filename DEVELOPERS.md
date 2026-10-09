@@ -19,7 +19,7 @@ Discord /build ─► bot.py ─ queue (~/ShipKit/builds.json)
 
 - **Game repos in `~/Documents/GitHub` are never modified.** They're only read for their GitHub URL and for `extra_files`. If your editor has the game open, the build still runs (separate clone); the owner just gets an FYI ping.
 - **Unity version** comes from each project's `ProjectVersion.txt`. The Unity CLI installs a missing editor, and `pipeline.py` adds missing Android/iOS modules.
-- **Version changes are never committed back.** Version, build number, cheat defines and signing are set only inside the batch Unity process.
+- **Only the shipped version is committed back.** Cheat defines and signing are set only inside the batch Unity process and reset after the build. After a successful Play upload, `commit_version_back` writes the shipped bundleVersion + versionCode into the game repo, commits and pushes (Android: default on, `"commit_version": false` in projects.json opts out; iOS `ship.py`: same after a TestFlight upload, `COMMIT_VERSION=0` opts out) - otherwise the repo lags Play and local builds are refused as downgrades.
 
 ### Files
 
@@ -129,7 +129,7 @@ Shown on a failed build message (❌ **CATEGORY**) with details in the thread.
 | `UNITY FAILED` | Compile errors or build exception. The thread shows the error lines; full Unity log attached |
 | `VERIFY FAILED` | Built AAB has the wrong package, target SDK < 35, wrong version code, bad signature, or a missing application class |
 | `APK FAILED` | bundletool couldn't make the APK |
-| `DRIVE FAILED` | Drive API off, service account not on the Shared Drive, external sharing blocked, or (personal Drive) the sign-in expired: run `tools/drive_login.py` again |
+| `DRIVE FAILED` | (5xx and dropped connections are retried 3 times first) Drive API off, service account not on the Shared Drive, external sharing blocked, or (personal Drive) the sign-in expired: run `tools/drive_login.py` again |
 | `PLAY FAILED` / `UPLOAD FAILED` | Service account lacks access, or Play already has a higher version code (rebuild) |
 | `XCODE FAILED` / `ASC FAILED` | Signing, provisioning or App Store Connect key problem |
 | `CRASHED` / `SCRIPT ERROR` / `BOT ERROR` | Bug in the pipeline or bot. Check the log |
